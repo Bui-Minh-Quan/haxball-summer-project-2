@@ -25,7 +25,7 @@ class HeuristicBot:
         # Strategic offset: get behind the ball relative to the target goal
         behind_offset = 25.0 if self.team == "blue" else -25.0
         target_pos = Vec2(ball.pos.x + behind_offset, ball.pos.y)
-
+        target_pos = bot_player.pos
         move_dir = (target_pos - bot_player.pos).normalize()
 
         # Kick when close and facing the opponent's half

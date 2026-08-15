@@ -114,22 +114,30 @@ class PlayState(GameState):
         for post in p.posts:
             self._draw_aa_entity(surface, cam.apply(post.pos), int(post.radius), (255, 255, 255), (40, 40, 40), 1)
 
-        # 2. Draw Entities
+        # ---------------------------------------------------------
+        # Z-INDEX FIX: Draw Ball FIRST so players render ON TOP
+        # ---------------------------------------------------------
+        ball = self.sim.ball
+        self._draw_aa_entity(surface, cam.apply(ball.pos), int(ball.radius), (255, 255, 255), (20, 20, 20), 2)
+
         # Red Team
         for player in self.sim.red_team:
             pos = cam.apply(player.pos)
-            # Invert to white disc with red border during the 120ms kick window
             fill_c = (225, 55, 55)
-            out_c = (225, 55, 55) if player.kick_visual_timer > 0 else (255, 255, 255)
-            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, outline_thickness=3)
+            # Outline is Black normally, White when kicking (using the visual timer!)
+            out_c = (255, 255, 255) if player.kick_visual_timer > 0 else (20, 20, 20)
+            thickness = 4 if player.kick_visual_timer > 0 else 3
+            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, thickness)
 
         # Blue Team
         for player in self.sim.blue_team:
             pos = cam.apply(player.pos)
             fill_c = (50, 110, 235)
-            out_c = (50, 110, 235) if player.kick_visual_timer > 0 else (255, 255, 255)
-            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, outline_thickness=3)
-
+            # Outline is Black normally, White when kicking
+            out_c = (255, 255, 255) if player.kick_visual_timer > 0 else (20, 20, 20)
+            thickness = 4 if player.kick_visual_timer > 0 else 3
+            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, thickness)
+            
         # Ball
         ball = self.sim.ball
         self._draw_aa_entity(surface, cam.apply(ball.pos), int(ball.radius), (255, 255, 255), (20, 20, 20), 2)

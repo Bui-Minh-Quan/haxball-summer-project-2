@@ -126,7 +126,13 @@ class Simulation:
         if dist <= kick_reach and dist > 0:
             normal = to_ball.normalize()
             effective_kick = self.cfg.KICK_STRENGTH * self.cfg.BALL_SPEED_MULT
-            self.ball.vel = normal * effective_kick
+            
+            # ADD player's current velocity to the kick for powerful forward shots
+            self.ball.vel = player.vel + (normal * effective_kick)
+            
+            # Consume the kick so it doesn't hit again in the next micro-substep
+            player.is_kicking = False
+
 
     def _resolve_circle_collision(self, d1: Disc, d2: Disc, restitution: float):
         delta = d2.pos - d1.pos
