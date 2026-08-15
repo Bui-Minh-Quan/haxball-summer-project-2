@@ -2,7 +2,7 @@ from config.physics_config import PhysicsConfig
 from src.engine.entities import Ball, Disc, Player
 from src.engine.pitch import Pitch
 from src.engine.vector import Vec2
-
+import math
 
 class Simulation:
 
@@ -158,8 +158,8 @@ class Simulation:
 
     def _resolve_player_bounds(self, player: Player):
         p = self.pitch
-        
-        # 1. Outer Fences
+
+        # 1. Outer Arena Fences
         if player.pos.x - player.radius < p.outer_left:
             player.pos.x = p.outer_left + player.radius
             player.vel.x = 0
@@ -174,31 +174,86 @@ class Simulation:
             player.pos.y = p.outer_bottom - player.radius
             player.vel.y = 0
 
-        # 2. Kick-off Invisible Walls
+        # 2. Kick-off Continuous Geometry
         if self.state == "KICKOFF":
-            c_rad = self.cfg.CENTER_CIRCLE_RADIUS
-            if player.team == "red":
-                # Red cannot enter Blue's half
-                if player.pos.x + player.radius > self.center.x:
-                    player.pos.x = self.center.x - player.radius
-                    player.vel.x = 0
-                
-                # If Blue is kicking, Red cannot enter center circle
-                if self.kickoff_team == "blue":
-                    if player.pos.distance_to(self.center) < c_rad + player.radius:
-                        normal = (player.pos - self.center).normalize()
-                        player.pos = self.center + normal * (c_rad + player.radius)
+            R = self.cfg.CENTER_CIRCLE_RADIUS
+            r = player.radius
+            
+            # sign = +1 for Red (attacks right), -1 for Blue (attacks left)
+            sign = 1.0 if player.team == "red" else -1.0
+            is_attacking = (player.team == self.kickoff_team)
+
+            # Local coordinates: positive rel_x = opponent's half, negative rel_x = own half
+            rel_x = (player.pos.x - self.center.x) * sign
+            rel_y = player.pos.y - self.center.y
+            vel_x = player.vel.x * sign
+            vel_y = player.vel.y
+
+            if is_attacking:
+                # ---------------------------------------------------------
+                # ATTACKING TEAM (Own half + entire center circle)
+                # ---------------------------------------------------------
+                if rel_x > 0:
+                    # Inside opponent's half: must stay within circle radius R
+                    dist = math.hypot(rel_x, rel_y)
+                    max_dist = R - r
+                    if dist > max_dist and dist > 0:
+                        nx, ny = rel_x / dist, rel_y / dist
+                        rel_x = nx * max_dist
+                        rel_y = ny * max_dist
+                        v_norm = vel_x * nx + vel_y * ny
+                        if v_norm > 0:
+                            vel_x -= v_norm * nx
+                            vel_y -= v_norm * ny
+                else:
+                    # Inside own half: cannot cross midline outside circle (|rel_y| > R)
+                    if abs(rel_y) > R:
+                        if rel_x + r > 0:
+                            rel_x = -r
+                            if vel_x > 0:
+                                vel_x = 0
+                    else:
+                        # Smooth corner junctions at (0, -R) and (0, +R)
+                        for corner_y in (-R, R):
+                            cdist = math.hypot(rel_x, rel_y - corner_y)
+                            if cdist < r and cdist > 0:
+                                cnx = rel_x / cdist
+                                cny = (rel_y - corner_y) / cdist
+                                rel_x = cnx * r
+                                rel_y = corner_y + cny * r
+                                cv_norm = vel_x * cnx + vel_y * cny
+                                if cv_norm < 0:
+                                    vel_x -= cv_norm * cnx
+                                    vel_y -= cv_norm * cny
+
             else:
-                # Blue cannot enter Red's half
-                if player.pos.x - player.radius < self.center.x:
-                    player.pos.x = self.center.x + player.radius
-                    player.vel.x = 0
-                
-                # If Red is kicking, Blue cannot enter center circle
-                if self.kickoff_team == "red":
-                    if player.pos.distance_to(self.center) < c_rad + player.radius:
-                        normal = (player.pos - self.center).normalize()
-                        player.pos = self.center + normal * (c_rad + player.radius)
+                # ---------------------------------------------------------
+                # DEFENDING TEAM (Must stay strictly in own half: rel_x <= -r)
+                # ---------------------------------------------------------
+                # A. Cannot cross midline into opponent's territory
+                if rel_x + r > 0:
+                    rel_x = -r
+                    if vel_x > 0:
+                        vel_x = 0
+
+                # B. Cannot enter center circle (stay outside radius R)
+                dist = math.hypot(rel_x, rel_y)
+                min_dist = R + r
+                if dist < min_dist and dist > 0:
+                    nx, ny = rel_x / dist, rel_y / dist
+                    rel_x = nx * min_dist
+                    rel_y = ny * min_dist
+                    v_norm = vel_x * nx + vel_y * ny
+                    if v_norm > 0:
+                        vel_x -= v_norm * nx
+                        vel_y -= v_norm * ny
+
+            # Transform back to global coordinates
+            player.pos.x = self.center.x + rel_x * sign
+            player.pos.y = self.center.y + rel_y
+            player.vel.x = vel_x * sign
+            player.vel.y = vel_y
+
 
     def _resolve_ball_bounds(self) -> str | None:
         p = self.pitch

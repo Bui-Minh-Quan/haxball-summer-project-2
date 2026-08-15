@@ -9,8 +9,8 @@ class PhysicsConfig:
     BALL_SPEED_MULT: float = 1.0   
 
     # Pitch Geometry
-    PITCH_WIDTH: float = 1800.0
-    PITCH_HEIGHT: float = 1000.0
+    PITCH_WIDTH: float = 1200.0
+    PITCH_HEIGHT: float = 800.0
 
     WIDTH_MARGIN: float = 80.0
     HEIGHT_MARGIN: float = 40.0
@@ -19,7 +19,7 @@ class PhysicsConfig:
     GOAL_WIDTH: float = 60.0
     GOAL_HEIGHT: float = 160.0
     GOAL_DEPTH: float = 60.0        # How deep the physical net goes
-    CENTER_CIRCLE_RADIUS: float = 75.0
+    CENTER_CIRCLE_RADIUS: float = 100.0
     POST_RADIUS: float = 8.0
 
     # Player Physics
