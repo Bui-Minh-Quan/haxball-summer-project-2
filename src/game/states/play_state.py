@@ -20,8 +20,8 @@ class PlayState(GameState):
         )
         self.bot = HeuristicBot(team="blue")
 
-        # Initialize Camera
-        self.camera = Camera(context.screen_width, context.screen_height)
+        # Initialize Camera with HUD height accounted for
+        self.camera = Camera(context.screen_width, context.screen_height, hud_height=50)
 
         self.font_score = pygame.font.SysFont("Arial", 28, bold=True)
         self.font_hud = pygame.font.SysFont("Arial", 16)
@@ -43,33 +43,35 @@ class PlayState(GameState):
         self.btn_pause.handle_event(event)
 
     def update(self, dt: float):
+        # 1. Inputs & Simulation Step
         keys = pygame.key.get_pressed()
-        
         move_red = Vec2(0, 0)
         if keys[pygame.K_w]: move_red.y -= 1
         if keys[pygame.K_s]: move_red.y += 1
         if keys[pygame.K_a]: move_red.x -= 1
         if keys[pygame.K_d]: move_red.x += 1
-
-
         kick_red = keys[pygame.K_SPACE]
 
         move_blue, kick_blue = self.bot.get_action(self.sim.blue_team[0], self.sim)
-    
+
         self.sim.step(
             red_inputs=[(move_red, kick_red)],
             blue_inputs=[(move_blue, kick_blue)],
             dt=dt,
         )
 
-        # Update Camera to follow the ball
+        # 2. Weighted Dual-Focus Camera (60% Player, 40% Ball)
+        local_player = self.sim.red_team[0]
+        ball = self.sim.ball
+        cam_target = (local_player.pos * 0.6) + (ball.pos * 0.4)
+
         p = self.sim.pitch
         world_bounds = pygame.Rect(
             p.outer_left, p.outer_top, 
             p.outer_right - p.outer_left, p.outer_bottom - p.outer_top
         )
-        self.camera.update(self.sim.ball.pos, world_bounds)
-
+        self.camera.update(cam_target, world_bounds, dt)
+        
     def _draw_aa_entity(self, surface, pos, radius, fill_color, outline_color, outline_thickness=3):
         """Helper to draw smooth thick anti-aliased circles."""
         x, y = pos
@@ -142,10 +144,51 @@ class PlayState(GameState):
         ball = self.sim.ball
         self._draw_aa_entity(surface, cam.apply(ball.pos), int(ball.radius), (255, 255, 255), (20, 20, 20), 2)
 
+        # ---------------------------------------------------------
+        # OFF-SCREEN BALL POINTER
+        # ---------------------------------------------------------
+        ball_sx, ball_sy = cam.apply(ball.pos)
+        margin = 25  # Distance from screen edge
+        hud_height = 50
+        
+        # Check if ball is outside the viewport
+        if (ball_sx < 0 or ball_sx > self.context.screen_width or
+            ball_sy < hud_height or ball_sy > self.context.screen_height):
+            
+            # Screen center
+            cx = self.context.screen_width / 2
+            cy = (self.context.screen_height + hud_height) / 2
+            
+            # Direction vector toward the ball
+            dx = ball_sx - cx
+            dy = ball_sy - cy
+            dist = (dx**2 + dy**2)**0.5
+            
+            if dist > 0:
+                nx, ny = dx / dist, dy / dist
+                
+                # Clamp pointer position to screen edges
+                ptr_x = max(margin, min(self.context.screen_width - margin, ball_sx))
+                ptr_y = max(hud_height + margin, min(self.context.screen_height - margin, ball_sy))
+                
+                # Polygon math for the triangle
+                size = 12
+                px, py = -ny, nx  # Perpendicular vector for the base of the triangle
+                
+                p1 = (ptr_x + nx * size, ptr_y + ny * size)  # Tip
+                p2 = (ptr_x + px * 10 - nx * size, ptr_y + py * 10 - ny * size)  # Bottom Left
+                p3 = (ptr_x - px * 10 - nx * size, ptr_y - py * 10 - ny * size)  # Bottom Right
+                
+                # Draw the pointer
+                pygame.gfxdraw.filled_polygon(surface, [p1, p2, p3], (255, 255, 255))
+                pygame.gfxdraw.aapolygon(surface, [p1, p2, p3], (20, 20, 20))
+
+
         # 3. GOAL! Celebration Text
         if self.sim.state == "GOAL_SCORED":
             goal_txt = self.font_big.render("GOAL!", True, (255, 220, 50))
             surface.blit(goal_txt, goal_txt.get_rect(center=(self.context.screen_width // 2, self.context.screen_height // 2 - 100)))
+
 
         # 4. Draw HUD (Fixed on screen, bypasses camera)
         hud_bar = pygame.Rect(0, 0, self.context.screen_width, 50)

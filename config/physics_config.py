@@ -9,8 +9,8 @@ class PhysicsConfig:
     BALL_SPEED_MULT: float = 1.0   
 
     # Pitch Geometry
-    PITCH_WIDTH: float = 1200.0
-    PITCH_HEIGHT: float = 600.0
+    PITCH_WIDTH: float = 1800.0
+    PITCH_HEIGHT: float = 1000.0
 
     WIDTH_MARGIN: float = 80.0
     HEIGHT_MARGIN: float = 40.0
@@ -37,6 +37,6 @@ class PhysicsConfig:
     BALL_PLAYER_RESTITUTION: float = 0.1  
 
     # Kick Mechanics
-    KICK_MARGIN: float = 1.0  
+    KICK_MARGIN: float = 3.0  
     KICK_STRENGTH: float = 1000.0  
-    KICK_COOLDOWN: float = 0.0
+    KICK_COOLDOWN: float = 0.1
