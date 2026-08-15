@@ -44,15 +44,18 @@ class PlayState(GameState):
 
     def update(self, dt: float):
         keys = pygame.key.get_pressed()
+        
         move_red = Vec2(0, 0)
         if keys[pygame.K_w]: move_red.y -= 1
         if keys[pygame.K_s]: move_red.y += 1
         if keys[pygame.K_a]: move_red.x -= 1
         if keys[pygame.K_d]: move_red.x += 1
+
+
         kick_red = keys[pygame.K_SPACE]
 
         move_blue, kick_blue = self.bot.get_action(self.sim.blue_team[0], self.sim)
-
+    
         self.sim.step(
             red_inputs=[(move_red, kick_red)],
             blue_inputs=[(move_blue, kick_blue)],
@@ -115,21 +118,17 @@ class PlayState(GameState):
         # Red Team
         for player in self.sim.red_team:
             pos = cam.apply(player.pos)
-            # Invert colors when kicking for strong visual feedback
-            fill_c = (0, 0, 0) if player.is_kicking else (225, 55, 55)
-            if player.is_kicking:
-                print("kick")
-            out_c = (255, 55, 55) if player.is_kicking else (255, 255, 255)
-            thickness = 4 if player.is_kicking else 3
-            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, thickness)
+            # Invert to white disc with red border during the 120ms kick window
+            fill_c = (225, 55, 55)
+            out_c = (225, 55, 55) if player.kick_visual_timer > 0 else (255, 255, 255)
+            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, outline_thickness=3)
 
         # Blue Team
         for player in self.sim.blue_team:
             pos = cam.apply(player.pos)
-            fill_c = (255, 255, 255) if player.is_kicking else (50, 110, 235)
-            out_c = (50, 110, 235) if player.is_kicking else (255, 255, 255)
-            thickness = 4 if player.is_kicking else 3
-            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, thickness)
+            fill_c = (50, 110, 235)
+            out_c = (50, 110, 235) if player.kick_visual_timer > 0 else (255, 255, 255)
+            self._draw_aa_entity(surface, pos, int(player.radius), fill_c, out_c, outline_thickness=3)
 
         # Ball
         ball = self.sim.ball

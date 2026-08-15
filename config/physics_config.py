@@ -23,20 +23,20 @@ class PhysicsConfig:
     POST_RADIUS: float = 8.0
 
     # Player Physics
-    PLAYER_RADIUS: float = 20.0
+    PLAYER_RADIUS: float = 25.0
     PLAYER_MASS: float = 2.0
     PLAYER_ACCEL: float = 3200.0  
     PLAYER_FRICTION: float = 0.94  
     PLAYER_RESTITUTION: float = 0.75  
 
     # Ball Physics
-    BALL_RADIUS: float = 11.0
-    BALL_MASS: float = 0.25  
-    BALL_FRICTION: float = 0.985  
+    BALL_RADIUS: float = 15.0
+    BALL_MASS: float = 0.35  
+    BALL_FRICTION: float = 0.975  
     BALL_RESTITUTION: float = 0.80  
-    BALL_PLAYER_RESTITUTION: float = 0.45  
+    BALL_PLAYER_RESTITUTION: float = 0.1  
 
     # Kick Mechanics
-    KICK_MARGIN: float = 6.0  
+    KICK_MARGIN: float = 1.0  
     KICK_STRENGTH: float = 1000.0  
-    KICK_COOLDOWN: float = 0.25
+    KICK_COOLDOWN: float = 0.0

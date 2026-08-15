@@ -58,11 +58,10 @@ class Simulation:
         
         # 1. State Machine Overrides
         if self.state == "GOAL_SCORED":
-            # Force stop players during the celebration
             red_inputs = [(Vec2(0,0), False) for _ in self.red_team]
             blue_inputs = [(Vec2(0,0), False) for _ in self.blue_team]
             for p in self.all_players:
-                p.vel *= 0.8  # Rapidly halt sliding players
+                p.vel *= 0.8
             
             self.state_timer -= dt
             if self.state_timer <= 0:
@@ -70,22 +69,23 @@ class Simulation:
                 return None
 
         elif self.state == "KICKOFF":
-            # If ball is moved or kicked, transition to normal play
             if self.ball.vel.length_sq() > 0 or self.ball.pos.distance_to(self.center) > 2.0:
                 self.state = "PLAYING"
 
-        # 2. Physics Micro-stepping
+        # 2. PROCESS INPUTS ONCE PER FRAME (Outside the substep loop)
+        for player, inp in zip(self.red_team, red_inputs):
+            player.process_input(inp[0], inp[1], dt)
+        for player, inp in zip(self.blue_team, blue_inputs):
+            player.process_input(inp[0], inp[1], dt)
+
+        # 3. Physics Micro-stepping
         SUBSTEPS = 6
         sub_dt = dt / SUBSTEPS
         triggered_goal = None
         
         for _ in range(SUBSTEPS):
-            for player, inp in zip(self.red_team, red_inputs):
-                player.apply_input(inp[0], inp[1], sub_dt)
-            for player, inp in zip(self.blue_team, blue_inputs):
-                player.apply_input(inp[0], inp[1], sub_dt)
-
             for player in self.all_players:
+                player.apply_accel(sub_dt)
                 player.step(sub_dt)
             self.ball.step(sub_dt)
 
@@ -113,6 +113,7 @@ class Simulation:
                 triggered_goal = evt
 
         return triggered_goal
+
 
     def _resolve_kick(self, player: Player):
         if not player.is_kicking:
@@ -225,7 +226,7 @@ class Simulation:
                 if self.state != "GOAL_SCORED" and b.pos.x < p.left:
                     self.score_blue += 1
                     self.state = "GOAL_SCORED"
-                    self.state_timer = 2.0  # 2 seconds celebration
+                    self.state_timer = 1.0  # 1 second celebration
                     self.kickoff_team = "red" # Conceding team gets kick-off
                     goal_event = "blue_goal"
             else:
