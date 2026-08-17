@@ -1,88 +1,103 @@
+import math
+from typing import Any
+
+from config.match_config import MatchConfig
 from config.physics_config import PhysicsConfig
 from src.engine.entities import Ball, Disc, Player
 from src.engine.pitch import Pitch
 from src.engine.vector import Vec2
-import math
+
 
 class Simulation:
 
-    def __init__(self, center_x: float = 600.0, center_y: float = 400.0, team_size: int = 1, cfg: PhysicsConfig | None = None):
+    def __init__(
+        self,
+        center_x: float = 600.0,
+        center_y: float = 400.0,
+        match_config: MatchConfig | None = None,
+        cfg: PhysicsConfig | None = None,
+    ):
         self.cfg = cfg or PhysicsConfig()
+        self.match_config = match_config
         self.center = Vec2(center_x, center_y)
-        self.pitch = Pitch(self.center, self.cfg)
-        self.team_size = team_size
+
+        # Dynamic Pitch Dimensions
+        pw = match_config.pitch_width if match_config else self.cfg.DEFAULT_PITCH_WIDTH
+        ph = match_config.pitch_height if match_config else self.cfg.DEFAULT_PITCH_HEIGHT
+        self.pitch = Pitch(self.center, self.cfg, width=pw, height=ph)
 
         self.ball = Ball(self.center, self.cfg)
+        self.all_players: list[Player] = []
+        self.controllers: list[Any] = []
         self.red_team: list[Player] = []
         self.blue_team: list[Player] = []
-        self._spawn_teams()
 
         self.score_red = 0
         self.score_blue = 0
-        
-        # Match States: "KICKOFF", "PLAYING", "GOAL_SCORED"
-        self.state = "KICKOFF"
-        self.kickoff_team = "red"  # Who gets the ball first
-        self.state_timer = 0.0
 
-    @property
-    def all_players(self) -> list[Player]:
-        return self.red_team + self.blue_team
+        self._spawn_roster()
+        if self.match_config and self.match_config.mode:
+            self.match_config.mode.init_mode(self)
 
-    def _spawn_teams(self):
-        self.red_team.clear()
-        self.blue_team.clear()
-        y_step = self.cfg.PITCH_HEIGHT / (self.team_size + 1)
-        for i in range(self.team_size):
-            y_pos = self.pitch.top + y_step * (i + 1)
-            self.red_team.append(Player(Vec2(self.pitch.left + 200, y_pos), "red", self.cfg))
-            self.blue_team.append(Player(Vec2(self.pitch.right - 200, y_pos), "blue", self.cfg))
+    def _spawn_roster(self):
+        if not self.match_config or not self.match_config.roster:
+            return
+
+        red_slots = [s for s in self.match_config.roster if s.team == "red"]
+        blue_slots = [s for s in self.match_config.roster if s.team == "blue"]
+
+        # Spawn Red team
+        y_step_red = self.pitch.height / (len(red_slots) + 1)
+        for i, slot in enumerate(red_slots):
+            y_pos = self.pitch.top + y_step_red * (i + 1)
+            player = Player(Vec2(self.pitch.left + 200, y_pos), "red", slot.stats)
+            self.red_team.append(player)
+            self.all_players.append(player)
+            self.controllers.append(slot.controller)
+
+        # Spawn Blue team
+        y_step_blue = self.pitch.height / (len(blue_slots) + 1)
+        for i, slot in enumerate(blue_slots):
+            y_pos = self.pitch.top + y_step_blue * (i + 1)
+            player = Player(Vec2(self.pitch.right - 200, y_pos), "blue", slot.stats)
+            self.blue_team.append(player)
+            self.all_players.append(player)
+            self.controllers.append(slot.controller)
 
     def reset_positions(self):
         self.ball.pos = self.center.copy()
         self.ball.vel = Vec2(0.0, 0.0)
 
-        y_step = self.cfg.PITCH_HEIGHT / (self.team_size + 1)
+        y_step_red = self.pitch.height / (len(self.red_team) + 1)
         for i, player in enumerate(self.red_team):
-            player.pos = Vec2(self.pitch.left + 200, self.pitch.top + y_step * (i + 1))
+            player.pos = Vec2(self.pitch.left + 200, self.pitch.top + y_step_red * (i + 1))
             player.vel = Vec2(0.0, 0.0)
 
+        y_step_blue = self.pitch.height / (len(self.blue_team) + 1)
         for i, player in enumerate(self.blue_team):
-            player.pos = Vec2(self.pitch.right - 200, self.pitch.top + y_step * (i + 1))
+            player.pos = Vec2(self.pitch.right - 200, self.pitch.top + y_step_blue * (i + 1))
             player.vel = Vec2(0.0, 0.0)
-            
-        self.state = "KICKOFF"
 
-    def step(self, red_inputs: list[tuple[Vec2, bool]], blue_inputs: list[tuple[Vec2, bool]], dt: float) -> str | None:
-        dt *= self.cfg.GAME_SPEED
-        
-        # 1. State Machine Overrides
-        if self.state == "GOAL_SCORED":
-            red_inputs = [(Vec2(0,0), False) for _ in self.red_team]
-            blue_inputs = [(Vec2(0,0), False) for _ in self.blue_team]
-            for p in self.all_players:
-                p.vel *= 0.8
-            
-            self.state_timer -= dt
-            if self.state_timer <= 0:
-                self.reset_positions()
-                return None
+    def step(self, dt: float) -> str | None:
+        if self.match_config:
+            dt *= self.match_config.game_speed
 
-        elif self.state == "KICKOFF":
-            if self.ball.vel.length_sq() > 0 or self.ball.pos.distance_to(self.center) > 2.0:
-                self.state = "PLAYING"
+        mode = self.match_config.mode if self.match_config else None
 
-        # 2. PROCESS INPUTS ONCE PER FRAME (Outside the substep loop)
-        for player, inp in zip(self.red_team, red_inputs):
-            player.process_input(inp[0], inp[1], dt)
-        for player, inp in zip(self.blue_team, blue_inputs):
-            player.process_input(inp[0], inp[1], dt)
+        # 1. Mode Hook
+        if mode:
+            mode.on_step(self, dt)
 
-        # 3. Physics Micro-stepping
+        # 2. Query Controllers
+        for idx, (player, controller) in enumerate(zip(self.all_players, self.controllers)):
+            move, kick = controller.get_action(idx, self)
+            player.process_input(move, kick, dt)
+
+        # 3. Micro-Stepping
         SUBSTEPS = 6
         sub_dt = dt / SUBSTEPS
-        triggered_goal = None
-        
+        goal_event = None
+
         for _ in range(SUBSTEPS):
             for player in self.all_players:
                 player.apply_accel(sub_dt)
@@ -92,28 +107,33 @@ class Simulation:
             for player in self.all_players:
                 self._resolve_kick(player)
 
+            # Player vs Player Collisions (Dynamic restitution)
             players = self.all_players
-            for i in range(len(players)):
-                for j in range(i + 1, len(players)):
-                    self._resolve_circle_collision(players[i], players[j], self.cfg.PLAYER_RESTITUTION)
+            num_players = len(players)
+            for i in range(num_players):
+                for j in range(i + 1, num_players):
+                    combined_restitution = math.sqrt(players[i].restitution * players[j].restitution)
+                    self._resolve_circle_collision(players[i], players[j], combined_restitution)
 
+            # Player vs Ball Collisions (Soft control restitution)
             for player in self.all_players:
                 self._resolve_circle_collision(player, self.ball, self.cfg.BALL_PLAYER_RESTITUTION)
 
+            # Post Collisions
             for post in self.pitch.posts:
                 self._resolve_circle_collision(self.ball, post, self.cfg.BALL_RESTITUTION)
                 for player in self.all_players:
-                    self._resolve_circle_collision(player, post, self.cfg.PLAYER_RESTITUTION)
+                    self._resolve_circle_collision(player, post, player.restitution)
 
-            for player in self.all_players:
-                self._resolve_player_bounds(player)
-            
-            evt = self._resolve_ball_bounds()
-            if evt:
-                triggered_goal = evt
+            # Mode Enforced Boundaries
+            if mode:
+                for player in self.all_players:
+                    mode.enforce_player_bounds(player, self)
+                evt = mode.enforce_ball_bounds(self)
+                if evt:
+                    goal_event = evt
 
-        return triggered_goal
-
+        return goal_event
 
     def _resolve_kick(self, player: Player):
         if not player.is_kicking:
@@ -121,25 +141,19 @@ class Simulation:
 
         to_ball = self.ball.pos - player.pos
         dist = to_ball.length()
-        kick_reach = player.radius + self.ball.radius + self.cfg.KICK_MARGIN
+        kick_reach = player.radius + self.ball.radius + player.stats.kick_margin
 
-        if dist <= kick_reach and dist > 0:
+        if 0 < dist <= kick_reach:
             normal = to_ball.normalize()
-            effective_kick = self.cfg.KICK_STRENGTH * self.cfg.BALL_SPEED_MULT
-            
-            # ADD player's current velocity to the kick for powerful forward shots
-            self.ball.vel = player.vel + (normal * effective_kick)
-            
-            # Consume the kick so it doesn't hit again in the next micro-substep
+            self.ball.vel = player.vel + (normal * player.stats.kick_strength)
             player.is_kicking = False
-
 
     def _resolve_circle_collision(self, d1: Disc, d2: Disc, restitution: float):
         delta = d2.pos - d1.pos
         dist = delta.length()
         min_dist = d1.radius + d2.radius
 
-        if dist < min_dist and dist > 0:
+        if 0 < dist < min_dist:
             normal = delta / dist
             overlap = min_dist - dist
             total_inv = d1.inv_mass + d2.inv_mass
@@ -155,169 +169,3 @@ class Simulation:
                 impulse = normal * j
                 d1.vel += impulse * d1.inv_mass
                 d2.vel -= impulse * d2.inv_mass
-
-    def _resolve_player_bounds(self, player: Player):
-        p = self.pitch
-
-        # 1. Outer Arena Fences
-        if player.pos.x - player.radius < p.outer_left:
-            player.pos.x = p.outer_left + player.radius
-            player.vel.x = 0
-        elif player.pos.x + player.radius > p.outer_right:
-            player.pos.x = p.outer_right - player.radius
-            player.vel.x = 0
-
-        if player.pos.y - player.radius < p.outer_top:
-            player.pos.y = p.outer_top + player.radius
-            player.vel.y = 0
-        elif player.pos.y + player.radius > p.outer_bottom:
-            player.pos.y = p.outer_bottom - player.radius
-            player.vel.y = 0
-
-        # 2. Kick-off Continuous Geometry
-        if self.state == "KICKOFF":
-            R = self.cfg.CENTER_CIRCLE_RADIUS
-            r = player.radius
-            
-            # sign = +1 for Red (attacks right), -1 for Blue (attacks left)
-            sign = 1.0 if player.team == "red" else -1.0
-            is_attacking = (player.team == self.kickoff_team)
-
-            # Local coordinates: positive rel_x = opponent's half, negative rel_x = own half
-            rel_x = (player.pos.x - self.center.x) * sign
-            rel_y = player.pos.y - self.center.y
-            vel_x = player.vel.x * sign
-            vel_y = player.vel.y
-
-            if is_attacking:
-                # ---------------------------------------------------------
-                # ATTACKING TEAM (Own half + entire center circle)
-                # ---------------------------------------------------------
-                if rel_x > 0:
-                    # Inside opponent's half: must stay within circle radius R
-                    dist = math.hypot(rel_x, rel_y)
-                    max_dist = R - r
-                    if dist > max_dist and dist > 0:
-                        nx, ny = rel_x / dist, rel_y / dist
-                        rel_x = nx * max_dist
-                        rel_y = ny * max_dist
-                        v_norm = vel_x * nx + vel_y * ny
-                        if v_norm > 0:
-                            vel_x -= v_norm * nx
-                            vel_y -= v_norm * ny
-                else:
-                    # Inside own half: cannot cross midline outside circle (|rel_y| > R)
-                    if abs(rel_y) > R:
-                        if rel_x + r > 0:
-                            rel_x = -r
-                            if vel_x > 0:
-                                vel_x = 0
-                    else:
-                        # Smooth corner junctions at (0, -R) and (0, +R)
-                        for corner_y in (-R, R):
-                            cdist = math.hypot(rel_x, rel_y - corner_y)
-                            if cdist < r and cdist > 0:
-                                cnx = rel_x / cdist
-                                cny = (rel_y - corner_y) / cdist
-                                rel_x = cnx * r
-                                rel_y = corner_y + cny * r
-                                cv_norm = vel_x * cnx + vel_y * cny
-                                if cv_norm < 0:
-                                    vel_x -= cv_norm * cnx
-                                    vel_y -= cv_norm * cny
-
-            else:
-                # ---------------------------------------------------------
-                # DEFENDING TEAM (Must stay strictly in own half: rel_x <= -r)
-                # ---------------------------------------------------------
-                # A. Cannot cross midline into opponent's territory
-                if rel_x + r > 0:
-                    rel_x = -r
-                    if vel_x > 0:
-                        vel_x = 0
-
-                # B. Cannot enter center circle (stay outside radius R)
-                dist = math.hypot(rel_x, rel_y)
-                min_dist = R + r
-                if dist < min_dist and dist > 0:
-                    nx, ny = rel_x / dist, rel_y / dist
-                    rel_x = nx * min_dist
-                    rel_y = ny * min_dist
-                    v_norm = vel_x * nx + vel_y * ny
-                    if v_norm > 0:
-                        vel_x -= v_norm * nx
-                        vel_y -= v_norm * ny
-
-            # Transform back to global coordinates
-            player.pos.x = self.center.x + rel_x * sign
-            player.pos.y = self.center.y + rel_y
-            player.vel.x = vel_x * sign
-            player.vel.y = vel_y
-
-
-    def _resolve_ball_bounds(self) -> str | None:
-        p = self.pitch
-        b = self.ball
-        goal_event = None
-
-        # 1. Pitch Top and Bottom
-        if b.pos.y - b.radius < p.top:
-            b.pos.y = p.top + b.radius
-            b.vel.y *= -b.restitution
-        elif b.pos.y + b.radius > p.bottom:
-            b.pos.y = p.bottom - b.radius
-            b.vel.y *= -b.restitution
-
-        # 2. Left Boundary & Goal Net
-        if b.pos.x - b.radius < p.left:
-            if p.goal_top <= b.pos.y <= p.goal_bottom:
-                # Inner Goal Net Bouncing
-                if b.pos.x - b.radius < p.left - self.cfg.GOAL_DEPTH:
-                    b.pos.x = p.left - self.cfg.GOAL_DEPTH + b.radius
-                    b.vel.x *= -b.restitution
-                
-                if b.pos.y - b.radius < p.goal_top:
-                    b.pos.y = p.goal_top + b.radius
-                    b.vel.y *= -b.restitution
-                elif b.pos.y + b.radius > p.goal_bottom:
-                    b.pos.y = p.goal_bottom - b.radius
-                    b.vel.y *= -b.restitution
-                
-                # Goal Trigger
-                if self.state != "GOAL_SCORED" and b.pos.x < p.left:
-                    self.score_blue += 1
-                    self.state = "GOAL_SCORED"
-                    self.state_timer = 1.0  # 1 second celebration
-                    self.kickoff_team = "red" # Conceding team gets kick-off
-                    goal_event = "blue_goal"
-            else:
-                b.pos.x = p.left + b.radius
-                b.vel.x *= -b.restitution
-
-        # 3. Right Boundary & Goal Net
-        elif b.pos.x + b.radius > p.right:
-            if p.goal_top <= b.pos.y <= p.goal_bottom:
-                # Inner Goal Net Bouncing
-                if b.pos.x + b.radius > p.right + self.cfg.GOAL_DEPTH:
-                    b.pos.x = p.right + self.cfg.GOAL_DEPTH - b.radius
-                    b.vel.x *= -b.restitution
-                
-                if b.pos.y - b.radius < p.goal_top:
-                    b.pos.y = p.goal_top + b.radius
-                    b.vel.y *= -b.restitution
-                elif b.pos.y + b.radius > p.goal_bottom:
-                    b.pos.y = p.goal_bottom - b.radius
-                    b.vel.y *= -b.restitution
-                
-                # Goal Trigger
-                if self.state != "GOAL_SCORED" and b.pos.x > p.right:
-                    self.score_red += 1
-                    self.state = "GOAL_SCORED"
-                    self.state_timer = 2.0
-                    self.kickoff_team = "blue"
-                    goal_event = "red_goal"
-            else:
-                b.pos.x = p.right - b.radius
-                b.vel.x *= -b.restitution
-
-        return goal_event

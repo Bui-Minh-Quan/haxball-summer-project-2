@@ -2,6 +2,11 @@ import pygame
 from src.game.state_manager import GameState
 from src.game.states.play_state import PlayState
 from src.game.ui.button import Button
+from config.match_config import MatchConfig, PlayerSlot, PlayerStats
+from src.bots.heuristic_bot import HeuristicBot
+from src.engine.controllers import HeuristicBotController
+from src.engine.modes.classic_mode import ClassicMatchMode
+from src.game.controllers import KeyboardController
 
 
 class MenuState(GameState):
@@ -30,7 +35,25 @@ class MenuState(GameState):
         ]
 
     def _start_game(self):
-        self.context.state_manager.change_state(PlayState(self.context))
+        # Build Match Setup dynamically
+        match_cfg = MatchConfig(
+            mode=ClassicMatchMode(time_limit=180.0, score_limit=3),
+            roster=[
+                PlayerSlot(
+                    team="red",
+                    stats=PlayerStats(name="Human Player", accel=3200.0),
+                    controller=KeyboardController(),
+                ),
+                PlayerSlot(
+                    team="blue",
+                    stats=PlayerStats(name="Bot Blue", accel=3000.0),
+                    controller=HeuristicBotController(HeuristicBot(team="blue")),
+                ),
+            ],
+            time_limit=180.0,
+            score_limit=3,
+        )
+        self.context.state_manager.change_state(PlayState(self.context, match_config=match_cfg))
 
     def _quit_game(self):
         self.context.running = False

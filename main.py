@@ -12,8 +12,8 @@ if __name__ == "__main__":
     max_h = info.current_h - 100
     
     # Calculate desired size based on pitch, but clamp it to the screen's max
-    desired_w = PhysicsConfig.PITCH_WIDTH + 200
-    desired_h = PhysicsConfig.PITCH_HEIGHT + 200
+    desired_w = PhysicsConfig.DEFAULT_PITCH_WIDTH + 200
+    desired_h = PhysicsConfig.DEFAULT_PITCH_HEIGHT + 200
     
     window_w = min(desired_w, max_w)
     window_h = min(desired_h, max_h)
