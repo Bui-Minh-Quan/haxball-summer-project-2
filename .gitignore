@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pytorch models
+training/models/*
+
+# Replay render files
+training/renders/*

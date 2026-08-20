@@ -12,7 +12,7 @@ class PlayerStats:
     accel: float = 3200.0
     friction: float = 0.94
     restitution: float = 0.75
-    kick_strength: float = 1000.0
+    kick_strength: float = 1400.0
     kick_cooldown: float = 0.10
     kick_margin: float = 6.0
 
@@ -36,4 +36,4 @@ class MatchConfig:
     pitch_height: float = 800.0
     time_limit: float = 180.0  # seconds (0 = infinite)
     score_limit: int = 3
-    game_speed: float = 1.0  # 1.0 = Normal, 0.5 = Slow-mo, 1.5 = Fast
+    game_speed: float = 0.6  # 1.0 = Normal, 0.5 = Slow-mo, 1.5 = Fast
