@@ -7,6 +7,7 @@ from src.game.camera import Camera
 from src.game.state_manager import GameState
 from src.game.states.pause_state import PauseState
 from src.game.ui.button import Button
+from typing import Any
 
 
 class PlayState(GameState):
@@ -163,7 +164,9 @@ class PlayState(GameState):
 
     def _draw_game_over_modal(self, surface: pygame.Surface):
         # Darkened Backdrop
-        overlay = pygame.Surface((self.context.screen_width, self.context.screen_height), pygame.SRCALPHA)
+        overlay = pygame.Surface(
+            (self.context.screen_width, self.context.screen_height), pygame.SRCALPHA
+        )
         overlay.fill((10, 12, 18, 200))
         surface.blit(overlay, (0, 0))
 
@@ -179,19 +182,30 @@ class PlayState(GameState):
         # Match Result Determination
         r_score = self.sim.score_red
         b_score = self.sim.score_blue
+        mode = self.match_config.mode
 
-        if r_score > b_score:
-            title_text = "RED IS VICTORIOUS"
-            title_color = (255, 215, 0)
-            sub_text = ""
-        elif b_score > r_score:
-            title_text = "BLUE IS VICTORIOUS"
-            title_color = (235, 75, 75)
-            sub_text = ""
+        # Objective match termination reason
+        if (
+            hasattr(mode, "score_limit")
+            and mode.score_limit > 0
+            and (r_score >= mode.score_limit or b_score >= mode.score_limit)
+        ):
+            sub_text = f"Score limit of {mode.score_limit} reached."
+        elif hasattr(mode, "time_remaining") and mode.time_remaining <= 0:
+            sub_text = "Full time reached."
         else:
-            title_text = "DRAW MATCH"
-            title_color = (100, 180, 255)
-            sub_text = ""
+            sub_text = "Match concluded."
+
+        # Neutral team outcome headers matching team jersey colors
+        if r_score > b_score:
+            title_text = "RED WINS"
+            title_color = (235, 75, 75)
+        elif b_score > r_score:
+            title_text = "BLUE WINS"
+            title_color = (75, 140, 245)
+        else:
+            title_text = "DRAW"
+            title_color = (210, 215, 225)
 
         # Render Modal Text
         t_surf = self.font_modal_title.render(title_text, True, title_color)
@@ -201,13 +215,14 @@ class PlayState(GameState):
         s_surf = self.font_score.render(score_str, True, (240, 240, 240))
         surface.blit(s_surf, s_surf.get_rect(center=(cx, cy - 35)))
 
-        sub_surf = self.font_modal_sub.render(sub_text, True, (160, 170, 190))
+        sub_surf = self.font_modal_sub.render(sub_text, True, (150, 160, 180))
         surface.blit(sub_surf, sub_surf.get_rect(center=(cx, cy + 5)))
 
-        # Draw Buttons
+        # Draw Action Buttons
         self.btn_retry.draw(surface)
         self.btn_menu.draw(surface)
         self.btn_exit.draw(surface)
+
 
     def draw(self, surface: pygame.Surface):
         surface.fill((28, 30, 38))
