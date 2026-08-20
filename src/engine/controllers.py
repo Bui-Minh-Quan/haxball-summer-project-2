@@ -13,11 +13,11 @@ class Controller(ABC):
 
 
 class HeuristicBotController(Controller):
-    """Wraps HeuristicBot into the engine controller interface."""
+    """Wraps TeamHeuristicCoordinator into the engine controller interface."""
 
-    def __init__(self, bot_instance: Any): # type: ignore
-        self.bot = bot_instance
+    def __init__(self, coordinator_instance: Any):
+        self.coordinator = coordinator_instance
 
-    def get_action(self, player_idx: int, sim: Any) -> tuple[Vec2, bool]: # pyright: ignore[reportUndefinedVariable]
+    def get_action(self, player_idx: int, sim: Any) -> tuple[Vec2, bool]:
         player = sim.all_players[player_idx]
-        return self.bot.get_action(player, sim)
+        return self.coordinator.get_action(player, sim)

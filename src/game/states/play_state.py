@@ -1,13 +1,14 @@
 import math
+from typing import Any
 import pygame
 import pygame.gfxdraw
 from config.match_config import MatchConfig
 from src.engine.simulation import Simulation
 from src.game.camera import Camera
+from src.game.controllers import KeyboardController
 from src.game.state_manager import GameState
 from src.game.states.pause_state import PauseState
 from src.game.ui.button import Button
-from typing import Any
 
 
 class PlayState(GameState):
@@ -24,6 +25,7 @@ class PlayState(GameState):
         self.camera = Camera(context.screen_width, context.screen_height, hud_height=50)
         self.font_score = pygame.font.SysFont("Arial", 28, bold=True)
         self.font_hud = pygame.font.SysFont("Arial", 16)
+        self.font_player_num = pygame.font.SysFont("Arial", 16, bold=True)
         self.font_big = pygame.font.SysFont("Arial", 60, bold=True)
         self.font_modal_title = pygame.font.SysFont("Arial", 36, bold=True)
         self.font_modal_sub = pygame.font.SysFont("Arial", 18)
@@ -36,7 +38,6 @@ class PlayState(GameState):
             self._pause_game,
         )
 
-        # Game Over State & Buttons
         self.is_game_over = False
         self._init_game_over_ui()
 
@@ -94,15 +95,12 @@ class PlayState(GameState):
 
     def update(self, dt: float):
         mode = self.match_config.mode
-
-        # Check Match End Trigger
         if hasattr(mode, "is_game_over") and mode.is_game_over(self.sim):
             self.is_game_over = True
 
         if not self.is_game_over:
             self.sim.step(dt=dt)
 
-        # Dual Focus Camera
         track_pos = self.sim.red_team[0].pos if self.sim.red_team else self.sim.center
         cam_target = (track_pos * 0.6) + (self.sim.ball.pos * 0.4)
 
@@ -113,7 +111,20 @@ class PlayState(GameState):
         )
         self.camera.update(cam_target, world_bounds, dt)
 
-    def _draw_aa_entity(self, surface, pos, radius, fill_color, outline_color, outline_thickness=3):
+    def _draw_player_halo(self, surface: pygame.Surface, pos: tuple[int, int], radius: int):
+        """Draws the translucent glowing ring around the controlled player."""
+        halo_radius = radius + 6
+        halo_surf = pygame.Surface((halo_radius * 2 + 4, halo_radius * 2 + 4), pygame.SRCALPHA)
+        center = (halo_radius + 2, halo_radius + 2)
+
+        # Translucent filled ring
+        pygame.draw.circle(halo_surf, (255, 255, 255, 60), center, halo_radius)
+        # Outer border
+        pygame.draw.circle(halo_surf, (255, 255, 255, 150), center, halo_radius, width=2)
+
+        surface.blit(halo_surf, (pos[0] - halo_radius - 2, pos[1] - halo_radius - 2))
+
+    def _draw_aa_entity(self, surface: pygame.Surface, pos: tuple[int, int], radius: int, fill_color, outline_color, outline_thickness=3):
         x, y = int(pos[0]), int(pos[1])
         pygame.gfxdraw.filled_circle(surface, x, y, radius, outline_color)
         pygame.gfxdraw.aacircle(surface, x, y, radius, outline_color)
@@ -133,7 +144,6 @@ class PlayState(GameState):
         team = getattr(mode, "kickoff_team", "red")
         team_color = (225, 55, 55) if team == "red" else (50, 110, 235)
 
-        # Centered Kickoff Banner under HUD
         cx = self.context.screen_width // 2
         cy = 82
         badge_w, badge_h = 240, 36
@@ -142,7 +152,7 @@ class PlayState(GameState):
         pygame.draw.rect(surface, (18, 20, 28), badge_rect, border_radius=18)
         pygame.draw.rect(surface, (50, 55, 70), badge_rect, width=2, border_radius=18)
 
-        # Circular Countdown Indicator
+        # Countdown Progress Arc
         arc_cx, arc_cy = cx - (badge_w // 2) + 22, cy
         arc_r = 11
         pygame.gfxdraw.aacircle(surface, arc_cx, arc_cy, arc_r, (60, 65, 80))
@@ -158,19 +168,14 @@ class PlayState(GameState):
                 pygame.draw.polygon(surface, team_color, points)
         pygame.gfxdraw.filled_circle(surface, arc_cx, arc_cy, 6, (18, 20, 28))
 
-        # Kickoff Label
         txt = self.font_hud.render(f"{team.upper()} KICK-OFF: {rem_time:.1f}s", True, (240, 240, 240))
         surface.blit(txt, (arc_cx + 18, cy - txt.get_height() // 2))
 
     def _draw_game_over_modal(self, surface: pygame.Surface):
-        # Darkened Backdrop
-        overlay = pygame.Surface(
-            (self.context.screen_width, self.context.screen_height), pygame.SRCALPHA
-        )
+        overlay = pygame.Surface((self.context.screen_width, self.context.screen_height), pygame.SRCALPHA)
         overlay.fill((10, 12, 18, 200))
         surface.blit(overlay, (0, 0))
 
-        # Modal Window Card
         cx = self.context.screen_width // 2
         cy = self.context.screen_height // 2
         card_w, card_h = 480, 280
@@ -179,35 +184,24 @@ class PlayState(GameState):
         pygame.draw.rect(surface, (24, 27, 36), card_rect, border_radius=14)
         pygame.draw.rect(surface, (60, 68, 88), card_rect, width=2, border_radius=14)
 
-        # Match Result Determination
         r_score = self.sim.score_red
         b_score = self.sim.score_blue
         mode = self.match_config.mode
 
-        # Objective match termination reason
-        if (
-            hasattr(mode, "score_limit")
-            and mode.score_limit > 0
-            and (r_score >= mode.score_limit or b_score >= mode.score_limit)
-        ):
+        if hasattr(mode, "score_limit") and mode.score_limit > 0 and (r_score >= mode.score_limit or b_score >= mode.score_limit):
             sub_text = f"Score limit of {mode.score_limit} reached."
         elif hasattr(mode, "time_remaining") and mode.time_remaining <= 0:
             sub_text = "Full time reached."
         else:
             sub_text = "Match concluded."
 
-        # Neutral team outcome headers matching team jersey colors
         if r_score > b_score:
-            title_text = "RED WINS"
-            title_color = (235, 75, 75)
+            title_text, title_color = "RED WINS", (235, 75, 75)
         elif b_score > r_score:
-            title_text = "BLUE WINS"
-            title_color = (75, 140, 245)
+            title_text, title_color = "BLUE WINS", (75, 140, 245)
         else:
-            title_text = "DRAW"
-            title_color = (210, 215, 225)
+            title_text, title_color = "DRAW", (210, 215, 225)
 
-        # Render Modal Text
         t_surf = self.font_modal_title.render(title_text, True, title_color)
         surface.blit(t_surf, t_surf.get_rect(center=(cx, cy - 80)))
 
@@ -218,18 +212,16 @@ class PlayState(GameState):
         sub_surf = self.font_modal_sub.render(sub_text, True, (150, 160, 180))
         surface.blit(sub_surf, sub_surf.get_rect(center=(cx, cy + 5)))
 
-        # Draw Action Buttons
         self.btn_retry.draw(surface)
         self.btn_menu.draw(surface)
         self.btn_exit.draw(surface)
-
 
     def draw(self, surface: pygame.Surface):
         surface.fill((28, 30, 38))
         p = self.sim.pitch
         cam = self.camera
 
-        # 1. Pitch & Markings
+        # 1. Pitch Markings
         pitch_rect = cam.apply_rect(pygame.Rect(p.left, p.top, p.width, p.height))
         pygame.draw.rect(surface, (45, 125, 60), pitch_rect)
         pygame.draw.rect(surface, (240, 240, 240), pitch_rect, width=4)
@@ -259,16 +251,32 @@ class PlayState(GameState):
         ball = self.sim.ball
         self._draw_aa_entity(surface, cam.apply(ball.pos), int(ball.radius), (255, 255, 255), (20, 20, 20), 2)
 
-        # 4. Players
-        for player in self.sim.red_team:
+        # 4. Players (with Controlled Halo Indicator & Numbers)
+        for i, player in enumerate(self.sim.red_team):
             pos = cam.apply(player.pos)
             out_c = (255, 255, 255) if player.kick_visual_timer > 0 else (20, 20, 20)
+
+            # Check if this player is controlled by keyboard
+            slot = self.match_config.roster[i] if i < len(self.match_config.roster) else None
+            is_human = isinstance(getattr(slot, "controller", None), KeyboardController)
+
+            if is_human:
+                self._draw_player_halo(surface, pos, int(player.radius))
+
             self._draw_aa_entity(surface, pos, int(player.radius), (225, 55, 55), out_c, 3)
 
-        for player in self.sim.blue_team:
+            # Number Text
+            num_txt = self.font_player_num.render(str(i + 1), True, (255, 255, 255))
+            surface.blit(num_txt, num_txt.get_rect(center=pos))
+
+        for j, player in enumerate(self.sim.blue_team):
             pos = cam.apply(player.pos)
             out_c = (255, 255, 255) if player.kick_visual_timer > 0 else (20, 20, 20)
+
             self._draw_aa_entity(surface, pos, int(player.radius), (50, 110, 235), out_c, 3)
+
+            num_txt = self.font_player_num.render(str(j + 1), True, (255, 255, 255))
+            surface.blit(num_txt, num_txt.get_rect(center=pos))
 
         # 5. Off-Screen Ball Indicator
         ball_sx, ball_sy = cam.apply(ball.pos)

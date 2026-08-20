@@ -7,7 +7,7 @@ class PlayerStats:
     """Individual player attributes for customization, RPG progression, or difficulty scaling."""
 
     name: str = "Player"
-    radius: float = 25.0
+    radius: float = 20.0
     mass: float = 2.0
     accel: float = 3200.0
     friction: float = 0.94
@@ -20,10 +20,10 @@ class PlayerStats:
 @dataclass
 class PlayerSlot:
     """Represents a single player slot in a team roster."""
-
     team: str  # "red", "blue", "neutral"
     stats: PlayerStats = field(default_factory=PlayerStats)
-    controller: Any = None  # Instance of Controller
+    controller: Any = None
+    role: str = "AUTO"  # "AUTO", "GK", "ST", "CM", "LW", "RW"
 
 
 @dataclass
@@ -34,7 +34,7 @@ class MatchConfig:
     roster: list[PlayerSlot] = field(default_factory=list)
     pitch_width: float = 1200.0
     pitch_height: float = 800.0
-    time_limit: float = 10.0  # seconds (0 = infinite)
+    time_limit: float = 180.0  # seconds (0 = infinite)
     kickoff_timeout: float = 10.0  # Max seconds allowed to take kickoff
     score_limit: int = 3
-    game_speed: float = 0.6  # 1.0 = Normal, 0.5 = Slow-mo, 1.5 = Fast
+    game_speed: float = 0.4  # 1.0 = Normal, 0.5 = Slow-mo, 1.5 = Fast

@@ -19,8 +19,8 @@ class PhysicsConfig:
     POST_RADIUS: float = 8.0
 
     # Global Ball Physics
-    BALL_RADIUS: float = 15.0
+    BALL_RADIUS: float = 10.0
     BALL_MASS: float = 0.1
     BALL_FRICTION: float = 0.975
     BALL_RESTITUTION: float = 0.80
-    BALL_PLAYER_RESTITUTION: float = 0.15
+    BALL_PLAYER_RESTITUTION: float = 0.25
