@@ -18,7 +18,12 @@ class Simulation:
         cfg: PhysicsConfig | None = None,
     ):
         self.cfg = cfg or PhysicsConfig()
-        self.match_config = match_config
+        self.match_config = match_config or MatchConfig()
+
+        self.mode = self.match_config.mode
+        if self.mode:
+            self.mode.init_mode(self)
+
         self.center = Vec2(center_x, center_y)
 
         # Dynamic Pitch Dimensions

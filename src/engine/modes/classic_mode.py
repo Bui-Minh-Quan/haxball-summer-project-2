@@ -1,46 +1,72 @@
+from typing import Any
 import math
 from src.engine.modes.base_mode import GameMode
+from config.match_config import MatchConfig
 from src.engine.vector import Vec2
-from typing import Any
 
 
 class ClassicMatchMode(GameMode):
 
-    def __init__(self, time_limit: float = 180.0, score_limit: int = 3):
+    def __init__(self, time_limit: float = 180.0, score_limit: int = 3, kickoff_timeout: float = 10.0):
         self.time_limit = time_limit
         self.score_limit = score_limit
+        self.kickoff_timeout = kickoff_timeout
         self.time_remaining = time_limit
-        self.state = "KICKOFF"
+        self.state = "KICKOFF"  # "KICKOFF", "PLAYING", "GOAL_SCORED"
         self.kickoff_team = "red"
         self.state_timer = 0.0
+        self.kickoff_timer = 0.0
 
     def init_mode(self, sim: Any):
+        # Sync parameters from match_config if provided
+        if hasattr(sim, "match_config") and sim.match_config:
+            self.time_limit = sim.match_config.time_limit
+            self.score_limit = sim.match_config.score_limit
+            self.kickoff_timeout = sim.match_config.kickoff_timeout
+
         sim.score_red = 0
         sim.score_blue = 0
         self.time_remaining = self.time_limit
         self.state = "KICKOFF"
         self.kickoff_team = "red"
+        self.kickoff_timer = 0.0
+        self.state_timer = 0.0
 
     def on_step(self, sim: Any, dt: float) -> str | None:
+        # 1. Main Match Timer (Only counts down while ball is in active play)
         if self.state == "PLAYING" and self.time_limit > 0:
             self.time_remaining = max(0.0, self.time_remaining - dt)
 
+        # 2. Post-Goal Celebration State (Frozen timer, resets to Kickoff)
         if self.state == "GOAL_SCORED":
             self.state_timer -= dt
             if self.state_timer <= 0.0:
                 sim.reset_positions()
                 self.state = "KICKOFF"
+                self.kickoff_timer = 0.0
                 return None
 
+        # 3. Kickoff State
         elif self.state == "KICKOFF":
-            if sim.ball.vel.length_sq() > 0 or sim.ball.pos.distance_to(sim.center) > 2.0:
+            # Transition to active play once ball moves from center spot
+            if sim.ball.vel.length_sq() > 1.0 or sim.ball.pos.distance_to(sim.center) > 2.0:
                 self.state = "PLAYING"
+                self.kickoff_timer = 0.0
+            else:
+                # Accumulate idle kickoff time
+                self.kickoff_timer += dt
+                if self.kickoff_timer >= self.kickoff_timeout:
+                    # Forfeit kickoff right to opponent and reset positions
+                    self.kickoff_team = "blue" if self.kickoff_team == "red" else "red"
+                    self.kickoff_timer = 0.0
+                    sim.reset_positions()
 
         return None
 
     def enforce_player_bounds(self, player: Any, sim: Any):
         p = sim.pitch
-        # 1. Outer Arena Fences
+
+        # 1. Outer Arena Physical Walls
         if player.pos.x - player.radius < p.outer_left:
             player.pos.x = p.outer_left + player.radius
             player.vel.x = 0
@@ -55,9 +81,9 @@ class ClassicMatchMode(GameMode):
             player.pos.y = p.outer_bottom - player.radius
             player.vel.y = 0
 
-        # 2. Kick-off Continuous Geometry
+        # 2. Kickoff Circle & Half-Pitch Geometric Boundaries
         if self.state == "KICKOFF":
-            R = sim.cfg.CENTER_CIRCLE_RADIUS
+            R = p.cfg.CENTER_CIRCLE_RADIUS
             r = player.radius
             sign = 1.0 if player.team == "red" else -1.0
             is_attacking = player.team == self.kickoff_team
@@ -68,6 +94,7 @@ class ClassicMatchMode(GameMode):
             vel_y = player.vel.y
 
             if is_attacking:
+                # Attacking team: Allowed in own half + inside center circle
                 if rel_x > 0:
                     dist = math.hypot(rel_x, rel_y)
                     max_dist = R - r
@@ -96,6 +123,7 @@ class ClassicMatchMode(GameMode):
                                     vel_x -= cv_norm * cnx
                                     vel_y -= cv_norm * cny
             else:
+                # Defending team: Must stay in own half outside center circle
                 if rel_x + r > 0:
                     rel_x = -r
                     if vel_x > 0:
@@ -120,6 +148,7 @@ class ClassicMatchMode(GameMode):
         b = sim.ball
         goal_event = None
 
+        # Top and Bottom Touchlines
         if b.pos.y - b.radius < p.top:
             b.pos.y = p.top + b.radius
             b.vel.y *= -b.restitution
@@ -127,10 +156,11 @@ class ClassicMatchMode(GameMode):
             b.pos.y = p.bottom - b.radius
             b.vel.y *= -b.restitution
 
+        # Left Net & Goal Posts (Red Goal line / Blue scores)
         if b.pos.x - b.radius < p.left:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x - b.radius < p.left - sim.cfg.GOAL_DEPTH:
-                    b.pos.x = p.left - sim.cfg.GOAL_DEPTH + b.radius
+                if b.pos.x - b.radius < p.left - p.cfg.GOAL_DEPTH:
+                    b.pos.x = p.left - p.cfg.GOAL_DEPTH + b.radius
                     b.vel.x *= -b.restitution
                 if b.pos.y - b.radius < p.goal_top:
                     b.pos.y = p.goal_top + b.radius
@@ -149,10 +179,11 @@ class ClassicMatchMode(GameMode):
                 b.pos.x = p.left + b.radius
                 b.vel.x *= -b.restitution
 
+        # Right Net & Goal Posts (Blue Goal line / Red scores)
         elif b.pos.x + b.radius > p.right:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x + b.radius > p.right + sim.cfg.GOAL_DEPTH:
-                    b.pos.x = p.right + sim.cfg.GOAL_DEPTH - b.radius
+                if b.pos.x + b.radius > p.right + p.cfg.GOAL_DEPTH:
+                    b.pos.x = p.right + p.cfg.GOAL_DEPTH - b.radius
                     b.vel.x *= -b.restitution
                 if b.pos.y - b.radius < p.goal_top:
                     b.pos.y = p.goal_top + b.radius

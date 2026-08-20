@@ -15,19 +15,19 @@ class ActorCritic(nn.Module):
     def __init__(self, obs_dim=68, move_dim=9, kick_dim=2):
         super().__init__()
         self.shared = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
-            nn.LayerNorm(256),
+            layer_init(nn.Linear(obs_dim, 512)),
+            nn.LayerNorm(512),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.LayerNorm(256),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
             nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.LayerNorm(256),
-            nn.Tanh(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512),
+            nn.Tanh()
         )
-        self.actor_move = layer_init(nn.Linear(256, move_dim), std=0.01)
-        self.actor_kick = layer_init(nn.Linear(256, kick_dim), std=0.01)
-        self.critic = layer_init(nn.Linear(256, 1), std=1.0)
+        self.actor_move = layer_init(nn.Linear(512, move_dim), std=0.01)
+        self.actor_kick = layer_init(nn.Linear(512, kick_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1.0)
 
     def forward(self, obs):
         feat = self.shared(obs)
