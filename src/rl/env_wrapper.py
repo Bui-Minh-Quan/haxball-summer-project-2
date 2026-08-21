@@ -46,7 +46,7 @@ class HaxballGymEnv(gym.Env):
 
         self.sim = Simulation(match_config=self.match_config)
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(68,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(80,), dtype=np.float32
         )
         self.action_space = spaces.MultiDiscrete([9, 2])
 

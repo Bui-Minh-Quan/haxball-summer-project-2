@@ -12,7 +12,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class ActorCritic(nn.Module):
 
-    def __init__(self, obs_dim=68, move_dim=9, kick_dim=2):
+    def __init__(self, obs_dim=80, move_dim=9, kick_dim=2):
         super().__init__()
         self.shared = nn.Sequential(
             layer_init(nn.Linear(obs_dim, 512)),
@@ -39,7 +39,7 @@ class ActorCritic(nn.Module):
         dist_kick = Categorical(logits=logits_kick)
 
         if action is None:
-            if deterministic:
+            if deterministic and not deterministic:
                 act_m = torch.argmax(logits_move, dim=-1)
                 act_k = torch.argmax(logits_kick, dim=-1)
             else:
