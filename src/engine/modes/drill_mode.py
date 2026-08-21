@@ -4,16 +4,20 @@ from src.engine.vector import Vec2
 
 
 class SoloDrillMode(GameMode):
-    """Curriculum Stage 1: Solo shooting drill."""
+    """Curriculum Stage 1: Solo shooting drill with single-tick goal debouncing."""
 
     def __init__(self, time_limit: float = 0.0):
         self.time_limit = time_limit
+        self.goal_cooldown = 0.0
 
     def init_mode(self, sim: Any):
         sim.score_red = 0
         sim.score_blue = 0
+        self.goal_cooldown = 0.0
 
     def on_step(self, sim: Any, dt: float) -> str | None:
+        if self.goal_cooldown > 0.0:
+            self.goal_cooldown = max(0.0, self.goal_cooldown - dt)
         return None
 
     def enforce_player_bounds(self, player: Any, sim: Any):
@@ -45,22 +49,24 @@ class SoloDrillMode(GameMode):
             b.pos.y = p.bottom - b.radius
             b.vel.y *= -b.restitution
 
-        # Left Boundary (Own Goal)
+        # Left Boundary (Own Net)
         if b.pos.x - b.radius < p.left:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x < p.left:
+                if b.pos.x < p.left and self.goal_cooldown <= 0.0:
                     sim.score_blue += 1
                     goal_event = "blue_goal"
+                    self.goal_cooldown = 0.30  # Debounce all micro-substeps
             else:
                 b.pos.x = p.left + b.radius
                 b.vel.x *= -b.restitution
 
-        # Right Boundary (Target Goal)
+        # Right Boundary (Target Net)
         elif b.pos.x + b.radius > p.right:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x > p.right:
+                if b.pos.x > p.right and self.goal_cooldown <= 0.0:
                     sim.score_red += 1
                     goal_event = "red_goal"
+                    self.goal_cooldown = 0.30  # Debounce all micro-substeps
             else:
                 b.pos.x = p.right - b.radius
                 b.vel.x *= -b.restitution

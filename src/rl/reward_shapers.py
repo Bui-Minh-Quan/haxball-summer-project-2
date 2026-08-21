@@ -18,75 +18,88 @@ class BaseRewardShaper(ABC):
 
 
 class Stage1Reward(BaseRewardShaper):
+    """
+    Stage 1 Full-Pitch Potential Reward:
+    - Orbit & Approach Potential (navigates behind the ball)
+    - Ball Progression Potential (drives ball to target goal)
+    - Clean Strike Bonus (rewards forward velocity on contact)
+    """
 
     def __init__(self):
+        self.prev_dist_to_prep = 0.0
         self.prev_ball_to_goal = 0.0
-        self.has_touched_ball = False
         self.has_scored = False
+        self.touched_this_ep = False
 
     def reset(self, sim: Simulation):
-        target_goal = Vec2(sim.pitch.right, sim.center.y)
-        self.prev_ball_to_goal = sim.ball.pos.distance_to(target_goal)
-        self.has_touched_ball = False
+        p = sim.pitch
+        agent = sim.red_team[0]
+        ball = sim.ball
+        opp_goal = Vec2(p.right, sim.center.y)
+
+        goal_dir = (opp_goal - ball.pos).normalize()
+        prep_pos = ball.pos - (goal_dir * 35.0)
+
+        self.prev_dist_to_prep = agent.pos.distance_to(prep_pos)
+        self.prev_ball_to_goal = ball.pos.distance_to(opp_goal)
         self.has_scored = False
+        self.touched_this_ep = False
 
     def compute_reward(
         self, sim: Simulation, goal_event: str | None, truncated: bool
     ) -> tuple[float, bool, dict]:
         agent = sim.red_team[0]
         ball = sim.ball
-        target_goal = Vec2(sim.pitch.right, sim.center.y)
+        p = sim.pitch
+        opp_goal = Vec2(p.right, sim.center.y)
 
-        curr_ball_to_goal = ball.pos.distance_to(target_goal)
-        dist_agent_to_ball = agent.pos.distance_to(ball.pos)
-        
-        # +1.0px tolerance to account for physics engine collision resolution
-        touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 1.0
+        goal_dir = (opp_goal - ball.pos).normalize()
+        prep_pos = ball.pos - (goal_dir * 35.0)
 
-        reward = -0.05  # Step time penalty
+        curr_dist_to_prep = agent.pos.distance_to(prep_pos)
+        curr_ball_to_goal = ball.pos.distance_to(opp_goal)
+        dist_to_ball = agent.pos.distance_to(ball.pos)
+        touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 2.0
 
-        # 1. First Touch Milestone
-        if dist_agent_to_ball <= touch_reach:
-            if not self.has_touched_ball:
-                reward += 5.0
-                self.has_touched_ball = True
+        reward = -0.05  # Lightweight step cost
 
-        # 2. Ball to Goal Progress (Only rewarded after making contact)
-        if self.has_touched_ball:
-            #print("toched")
-            delta_ball = self.prev_ball_to_goal - curr_ball_to_goal
-            if delta_ball > 0:
-                reward += delta_ball * 0.05  # e.g., moving ball 200px forward = +10.0
-        
+        # 1. Orbit & Approach Gradient (Continuous guidance to get behind the ball)
+        prep_delta = self.prev_dist_to_prep - curr_dist_to_prep
+        reward += prep_delta * 0.04
 
-            
-        # 3. Terminal Conditions
+        # 2. Ball Progress Gradient (Positive when ball moves closer to target net)
+        ball_delta = self.prev_ball_to_goal - curr_ball_to_goal
+        reward += ball_delta * 0.08
+
+        # 3. Direct Contact & Forward Shot Bonus
+        if dist_to_ball <= touch_reach:
+            self.touched_this_ep = True
+            # Reward kicking/pushing ball forward
+            if ball.vel.x > 50.0:
+                reward += (ball.vel.x / 1000.0) * 0.1
+
+        # 4. Terminal Rewards
         terminated = False
         if goal_event == "red_goal":
             reward += 100.0
             self.has_scored = True
             terminated = True
         elif goal_event == "blue_goal":
-            reward -= 100.0  # Punish own goals
+            reward -= 50.0  # Punish own goals
             terminated = True
 
-        # 4. Timeout penalty
-        if truncated and not terminated:
-            reward -= 50.0
+        
 
+        self.prev_dist_to_prep = curr_dist_to_prep
         self.prev_ball_to_goal = curr_ball_to_goal
 
-        # Single source of truth for the logger
         info = {
             "is_goal": self.has_scored,
-            "touched": self.has_touched_ball,
+            "conceded": goal_event == "blue_goal",
+            "touched": self.touched_this_ep,
         }
 
-
         return reward, terminated, info
-
-
-
 
 class Stage2Reward(BaseRewardShaper):
     """

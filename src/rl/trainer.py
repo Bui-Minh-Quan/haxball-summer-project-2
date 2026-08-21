@@ -81,7 +81,8 @@ def train_ppo_vectorized(
     num_steps: int = 256,
     eval_freq: int = 100_000,
     eval_episodes: int = 50,
-    save_dir: str = "models/stage2",
+    save_dir: str = "models/stage1",
+    model_name: str = "best_model",
     lr_initial: float = 2.5e-4,
     lr_final: float = 1e-5,
     ent_coef_initial: float = 0.01,
@@ -236,7 +237,7 @@ def train_ppo_vectorized(
             # Strictly evaluate and save inside the evaluation trigger
             if current_eval_key > best_eval_key:
                 best_eval_key = current_eval_key
-                save_path = os.path.join(save_dir, "best_stage2.pt")
+                save_path = os.path.join(save_dir, f"{model_name}.pt")
                 torch.save(model.state_dict(), save_path)
                 print(
                     f"   ⭐ New verified best model saved: {save_path}\n"
@@ -246,6 +247,6 @@ def train_ppo_vectorized(
                     f"Speed: {metrics['avg_steps']:.1f} steps]\n"
                 )
 
-    final_path = os.path.join(save_dir, "final_stage2.pt")
+    final_path = os.path.join(save_dir, "final_model.pt")
     torch.save(model.state_dict(), final_path)
     print(f"✅ Training completed. Final model saved to {final_path}")

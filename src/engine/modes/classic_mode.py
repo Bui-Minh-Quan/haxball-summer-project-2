@@ -34,7 +34,7 @@ class ClassicMatchMode(GameMode):
 
     def on_step(self, sim: Any, dt: float) -> str | None:
         # 1. Main Match Timer (Only counts down while ball is in active play)
-        if self.state == "PLAYING" and self.time_limit > 0:
+        if self.time_limit > 0 and self.state != "GOAL_SCORED":
             self.time_remaining = max(0.0, self.time_remaining - dt)
 
         # 2. Post-Goal Celebration State (Frozen timer, resets to Kickoff)
