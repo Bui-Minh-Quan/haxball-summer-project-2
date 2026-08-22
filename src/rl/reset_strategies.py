@@ -63,3 +63,52 @@ class MatchKickoffReset(BaseResetStrategy):
 
     def reset(self, sim: Simulation):
         sim.reset_positions()
+
+class ActiveSparringReset(BaseResetStrategy):
+    """
+    Randomized Scramble Possession Reset:
+    Generates varied 1v1 tactical scenarios across the pitch,
+    bypassing rigid kickoff walls to preserve fluid attacking mechanics.
+    """
+
+    def __init__(self, kickoff_prob: float = 0.15):
+        self.kickoff_prob = kickoff_prob
+
+    def reset(self, sim: Simulation):
+        p = sim.pitch
+        agent = sim.red_team[0]
+        bot = sim.blue_team[0]
+        ball = sim.ball
+        sim.reset_positions()
+
+        if random.random() < self.kickoff_prob:
+            # Match Kickoff scenario
+            if hasattr(sim.mode, "state"):
+                sim.mode.state = "KICKOFF"
+                sim.mode.kickoff_team = "red" if random.random() < 0.6 else "blue"
+                sim.mode.kickoff_timer = 0.0
+        else:
+            # Active Open-Play Contest
+            if hasattr(sim.mode, "state"):
+                sim.mode.state = "PLAYING"
+                sim.mode.kickoff_timer = 0.0
+
+            # Ball spawns in midfield / central area
+            ball.pos.x = random.uniform(sim.center.x - 200.0, sim.center.x + 200.0)
+            ball.pos.y = random.uniform(p.top + 100.0, p.bottom - 100.0)
+            ball.vel = Vec2(0.0, 0.0)
+
+            # Agent spawns on attacking or defensive side of the ball
+            agent_x = max(p.left + 80.0, min(p.right - 80.0, ball.pos.x - random.uniform(60.0, 180.0)))
+            agent_y = random.uniform(p.top + 80.0, p.bottom - 80.0)
+            agent.pos = Vec2(agent_x, agent_y)
+            agent.vel = Vec2(0.0, 0.0)
+            agent.kick_cooldown_timer = 0.0
+
+            # Bot spawns on the opposing side
+            bot_x = max(p.left + 80.0, min(p.right - 80.0, ball.pos.x + random.uniform(60.0, 220.0)))
+            bot_y = random.uniform(p.top + 80.0, p.bottom - 80.0)
+            bot.pos = Vec2(bot_x, bot_y)
+            bot.vel = Vec2(0.0, 0.0)
+            bot.kick_cooldown_timer = 0.0
+
