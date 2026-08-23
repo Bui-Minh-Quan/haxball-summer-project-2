@@ -216,7 +216,7 @@ class Stage3SelfPlayReward:
                     rewards[i] -= 100.0
         elif truncated:
             # Active punishment for stalling / running out the clock
-            rewards.fill(-50.0)
+            rewards.fill(-70.0)
 
         info = {
             "is_goal": goal_event is not None,
@@ -224,4 +224,84 @@ class Stage3SelfPlayReward:
             "draw": truncated and (goal_event is None),
         }
 
+        return rewards, terminated, info
+
+
+class Stage3_2RoleReward:
+    """Asymmetric 2v2 Role Rewards (ST + CB)."""
+
+    def __init__(self):
+        self.last_touch_team = None
+        self.last_touch_player_idx = None
+        self.last_touch_pos = None
+
+    def reset(self, sim: Any):
+        self.last_touch_team = None
+        self.last_touch_player_idx = None
+        self.last_touch_pos = None
+
+    def compute_reward(self, sim: Any, goal_event: str | None, truncated: bool, rl_slots: list[dict]) -> tuple:
+        rewards = np.zeros(len(rl_slots), dtype=np.float32)
+        terminated = False
+        ball = sim.ball
+        p = sim.pitch
+        
+        player_to_slot = {slot["player"]: i for i, slot in enumerate(rl_slots)}
+
+        # 1. Event Tracking (Passes, Clearances, Turnovers)
+        for player in sim.all_players:
+            touch_reach = player.radius + ball.radius + player.stats.kick_margin + 2.0
+            
+            if player.pos.distance_to(ball.pos) <= touch_reach:
+                # Is it an RL agent touching the ball?
+                if player in player_to_slot:
+                    i = player_to_slot[player]
+                    slot = rl_slots[i]
+                    sign = 1.0 if slot["team"] == "red" else -1.0
+                    
+                    is_att_third = (player.pos.x - sim.center.x) * sign > (p.width / 6.0)
+                    is_def_third = (player.pos.x - sim.center.x) * sign < -(p.width / 6.0)
+
+                    # A. Striker: High Press Turnover Bonus
+                    if slot["role"] == "ST" and is_att_third and self.last_touch_team != slot["team"]:
+                        rewards[i] += 1.5  # Won the ball deep in enemy territory
+                    
+                    # B. Center Back: Clearance Bonus
+                    if slot["role"] == "CB" and is_def_third and player.is_kicking:
+                        if (ball.vel.x * sign) > 300.0:  # Hard kick away from own net
+                            rewards[i] += 1.5
+                            
+                    # C. Pass Connection
+                    if self.last_touch_team == slot["team"] and self.last_touch_player_idx != i:
+                        if self.last_touch_pos and self.last_touch_pos.distance_to(ball.pos) > 120.0:
+                            # Pass completed! Reward both receiver and passer
+                            rewards[i] += 1.0 # Receiver
+                            if self.last_touch_player_idx is not None:
+                                rewards[self.last_touch_player_idx] += 1.5 # Passer
+
+                # Update state tracking
+                self.last_touch_team = "red" if player in sim.red_team else "blue"
+                self.last_touch_player_idx = player_to_slot.get(player, None)
+                self.last_touch_pos = ball.pos.copy()
+
+        # 2. Terminal Rewards (Asymmetric)
+        if goal_event is not None:
+            terminated = True
+            for i, slot in enumerate(rl_slots):
+                is_my_goal = goal_event == f"{slot['team']}_goal"
+                
+                if slot["role"] == "ST":
+                    rewards[i] += 10.0 if is_my_goal else -4.0  # ST rewarded heavily for scoring, mildly punished for conceding
+                elif slot["role"] == "CB":
+                    rewards[i] += 4.0 if is_my_goal else -10.0  # CB heavily punished for conceding, mildly rewarded for scoring
+                    
+        elif truncated:
+            # Draw timeout
+            for i, slot in enumerate(rl_slots):
+                if slot["role"] == "ST":
+                    rewards[i] -= 3.0  # ST failed to score
+                elif slot["role"] == "CB":
+                    rewards[i] += 2.0  # CB successfully defended a 0-0 draw!
+
+        info = {"is_goal": goal_event is not None, "goal_event": goal_event}
         return rewards, terminated, info

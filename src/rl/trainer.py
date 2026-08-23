@@ -11,7 +11,7 @@ from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.rl.benchmarker import RLController
 
-
+# Evaluation functions
 def evaluate_policy_benchmark(
     eval_env,
     model: ActorCritic,
@@ -200,7 +200,165 @@ def evaluate_multi_agent_benchmark(
         "total_episodes": num_episodes,
     }
 
+def evaluate_league_benchmark(
+    eval_env,
+    model: nn.Module,
+    device: torch.device,
+    num_episodes: int = 30,
+    base_seed: int = 1000,
+) -> dict:
+    """Evaluates the active learner team (Red) against the League Opponent Pool (Blue)."""
+    model.eval()
+    red_wins = 0
+    blue_wins = 0
+    draws = 0
+    total_rewards = []
 
+    obs_space_shape = eval_env.observation_space.shape
+    if len(obs_space_shape) == 1:
+        num_agents = 1
+        obs_dim = obs_space_shape[0]
+    else:
+        num_agents = obs_space_shape[0]
+        obs_dim = obs_space_shape[1]
+
+    for ep in range(num_episodes):
+        obs, _ = eval_env.reset(seed=base_seed + ep)
+        done = False
+        goal_event = None
+        ep_reward = 0.0
+
+        while not done:
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).view(-1, obs_dim)
+            with torch.no_grad():
+                action, _, _, _ = model.get_action_and_value(obs_tensor, deterministic=True)
+
+            if num_agents == 1:
+                act_np = action.squeeze(0).cpu().numpy()
+            else:
+                act_np = action.view(num_agents, 2).cpu().numpy()
+
+            obs, reward, term, trunc, info = eval_env.step(act_np)
+            ep_reward += reward
+            done = term or trunc
+            if info.get("goal_event"):
+                goal_event = info.get("goal_event")
+
+        total_rewards.append(ep_reward)
+        if goal_event == "red_goal":
+            red_wins += 1
+        elif goal_event == "blue_goal":
+            blue_wins += 1
+        else:
+            draws += 1
+
+    model.train()
+    return {
+        "red_win_rate": (red_wins / num_episodes) * 100.0,
+        "blue_win_rate": (blue_wins / num_episodes) * 100.0,
+        "draw_rate": (draws / num_episodes) * 100.0,
+        "mean_reward": float(np.mean(total_rewards)),
+    }
+
+def evaluate_strict_promotion(
+    current_model: nn.Module,
+    best_model: nn.Module,
+    device: torch.device,
+    is_2v2: bool = False,
+    matches_per_side: int = 10,
+    time_limit: float = 15.0,
+) -> dict:
+    """Fast, deterministic evaluation gauntlet against Previous Best and Heuristic Bot."""
+    current_model.eval()
+    best_model.eval()
+
+    def run_match_series(red_type: str, blue_type: str) -> tuple[int, int, int]:
+        # Build controllers
+        if red_type == "current":
+            red_ctrl = RLController(current_model, team="red", device=device)
+        elif red_type == "best":
+            red_ctrl = RLController(best_model, team="red", device=device)
+        else:
+            red_ctrl = HeuristicBotController(TeamHeuristicCoordinator(team="red"))
+
+        if blue_type == "current":
+            blue_ctrl = RLController(current_model, team="blue", device=device)
+        elif blue_type == "best":
+            blue_ctrl = RLController(best_model, team="blue", device=device)
+        else:
+            blue_ctrl = HeuristicBotController(TeamHeuristicCoordinator(team="blue"))
+
+        if is_2v2:
+            roster = [
+                PlayerSlot("red", PlayerStats("Red_ST", accel=3200.0), red_ctrl, role="ST"),
+                PlayerSlot("red", PlayerStats("Red_CB", accel=3200.0), red_ctrl, role="CB"),
+                PlayerSlot("blue", PlayerStats("Blue_ST", accel=3200.0), blue_ctrl, role="ST"),
+                PlayerSlot("blue", PlayerStats("Blue_CB", accel=3200.0), blue_ctrl, role="CB"),
+            ]
+        else:
+            roster = [
+                PlayerSlot("red", PlayerStats("Red", accel=3200.0), red_ctrl, role="ST"),
+                PlayerSlot("blue", PlayerStats("Blue", accel=3200.0), blue_ctrl, role="ST"),
+            ]
+
+        cfg = MatchConfig(
+            mode=ClassicMatchMode(time_limit=time_limit, score_limit=1),
+            roster=roster,
+            time_limit=time_limit,
+            score_limit=1,
+        )
+
+        w, l, d = 0, 0, 0
+        dt = 1.0 / 60.0
+
+        for _ in range(matches_per_side):
+            sim = Simulation(match_config=cfg)
+            while not sim.mode.is_game_over(sim):
+                sim.step(dt)
+
+            if sim.score_red > sim.score_blue:
+                w += 1
+            elif sim.score_blue > sim.score_red:
+                l += 1
+            else:
+                d += 1
+        return w, l, d
+
+    # 1. Vs Previous Best (Red side then Blue side)
+    curr_r_w, curr_r_l, curr_r_d = run_match_series("current", "best")
+    best_r_w, best_r_l, best_r_d = run_match_series("best", "current")
+
+    vs_best_wins = curr_r_w + best_r_l
+    vs_best_losses = curr_r_l + best_r_w
+    vs_best_draws = curr_r_d + best_r_d
+
+    # 2. Vs Heuristic Bot (Red side then Blue side)
+    curr_h_w, curr_h_l, curr_h_d = run_match_series("current", "heuristic")
+    heur_r_w, heur_r_l, heur_r_d = run_match_series("heuristic", "current")
+
+    vs_heur_wins = curr_h_w + heur_r_l
+    vs_heur_losses = curr_h_l + heur_r_w
+    vs_heur_draws = curr_h_d + heur_r_d
+
+    current_model.train()
+
+    # Strict promotion: Must have positive win differential on both opponents
+    is_promoted = (
+        (vs_best_wins > vs_best_losses)
+        and (vs_heur_wins >= vs_heur_losses)
+        and (vs_best_wins + vs_heur_wins > 0)
+    )
+
+    return {
+        "vs_best_wins": vs_best_wins,
+        "vs_best_losses": vs_best_losses,
+        "vs_best_draws": vs_best_draws,
+        "vs_heur_wins": vs_heur_wins,
+        "vs_heur_losses": vs_heur_losses,
+        "vs_heur_draws": vs_heur_draws,
+        "is_promoted": is_promoted,
+    }
+# Training functions
 def train_ppo_vectorized(
     envs,
     eval_env,
@@ -622,15 +780,15 @@ def train_ppo_multi_agent(
 def train_ppo_league(
     envs,
     eval_env,
-    model,
+    model: nn.Module,
     device: torch.device,
     total_timesteps: int = 15_000_000,
     num_envs: int = 16,
     num_steps: int = 256,
     eval_freq: int = 100_000,
-    eval_episodes: int = 50,
-    save_dir: str = "models/stage3_league",
-    pool_dir: str = "models/stage3_league/pool",
+    eval_episodes: int = 30,
+    save_dir: str = "models/stage3/best",
+    pool_dir: str = "models/stage3/pool",
     lr_initial: float = 8e-5,
     lr_final: float = 5e-6,
     gamma: float = 0.99,
@@ -641,33 +799,49 @@ def train_ppo_league(
 ):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(pool_dir, exist_ok=True)
-    
-    # Initialize the pool with the starting model
+
+    # Bootstrap the league pool with the initial checkpoint
     torch.save(model.state_dict(), os.path.join(pool_dir, "latest.pt"))
     torch.save(model.state_dict(), os.path.join(pool_dir, "history_0.pt"))
 
-    optimizer = optim.Adam(model.parameters(), lr=lr_initial, eps=1e-5)
-    obs_dim = envs.single_observation_space.shape[0]
+    # Dynamically detect single-agent vs multi-agent observation shapes
+    single_obs_shape = envs.single_observation_space.shape
+    if len(single_obs_shape) == 1:
+        num_agents_per_env = 1
+        obs_dim = single_obs_shape[0]
+    else:
+        num_agents_per_env = single_obs_shape[0]
+        obs_dim = single_obs_shape[1]
 
-    obs = torch.zeros((num_steps, num_envs, obs_dim)).to(device)
-    actions = torch.zeros((num_steps, num_envs, 2)).to(device)
-    logprobs = torch.zeros((num_steps, num_envs)).to(device)
-    rewards = torch.zeros((num_steps, num_envs)).to(device)
-    dones = torch.zeros((num_steps, num_envs)).to(device)
-    values = torch.zeros((num_steps, num_envs)).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr_initial, eps=1e-5)
+
+    # Tensor buffers supporting arbitrary N vs M agent rosters
+    obs = torch.zeros((num_steps, num_envs, num_agents_per_env, obs_dim), device=device)
+    actions = torch.zeros((num_steps, num_envs, num_agents_per_env, 2), device=device)
+    logprobs = torch.zeros((num_steps, num_envs, num_agents_per_env), device=device)
+    rewards = torch.zeros((num_steps, num_envs, num_agents_per_env), device=device)
+    dones = torch.zeros((num_steps, num_envs), device=device)
+    values = torch.zeros((num_steps, num_envs, num_agents_per_env), device=device)
+
+    next_obs_np, _ = envs.reset()
+    next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device).view(
+        num_envs, num_agents_per_env, obs_dim
+    )
+    next_done = torch.zeros(num_envs, device=device)
 
     global_step = 0
     next_eval_step = eval_freq
     next_history_save = 500_000
-    
-    # Track the best performing model
-    best_eval_key = -float('inf')
+    best_eval_score = -float("inf")
 
-    next_obs, _ = envs.reset()
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(num_envs).to(device)
+    print(
+        f"🚀League Training Started | "
+        f"Agents/Env: {num_agents_per_env} | Dim: {obs_dim} | "
+        f"Batch Size: {num_steps * num_envs * num_agents_per_env}"
+    )
 
-    print(f"🚀 Fictitious Self-Play League Training Started")
+    best_model_gatekeeper = type(model)(obs_dim=obs_dim).to(device)
+    best_model_gatekeeper.load_state_dict(model.state_dict())
 
     while global_step < total_timesteps:
         progress = global_step / total_timesteps
@@ -676,51 +850,83 @@ def train_ppo_league(
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
 
+        # 1. Rollout Collection
         for step in range(num_steps):
-            global_step += num_envs
+            global_step += num_envs * num_agents_per_env
             obs[step] = next_obs
             dones[step] = next_done
 
+            obs_flat = next_obs.view(-1, obs_dim)
             with torch.no_grad():
-                action, logprob, _, value = model.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action_flat, logprob_flat, _, val_flat = model.get_action_and_value(obs_flat)
 
-            actions[step] = action
-            logprobs[step] = logprob
+            actions[step] = action_flat.view(num_envs, num_agents_per_env, 2)
+            logprobs[step] = logprob_flat.view(num_envs, num_agents_per_env)
+            values[step] = val_flat.view(num_envs, num_agents_per_env)
 
-            next_obs_np, reward_np, terms, truncs, _ = envs.step(action.cpu().numpy())
+            actions_np = actions[step].cpu().numpy()
+            if num_agents_per_env == 1:
+                actions_step_np = actions_np.squeeze(1)
+            else:
+                actions_step_np = actions_np
+
+            next_obs_np, scalar_reward_np, terms, truncs, infos = envs.step(actions_step_np)
+
+            # Extract per-agent asymmetric rewards from environment info
+            if isinstance(infos, dict) and "agent_rewards" in infos:
+                agent_rewards_np = np.array(infos["agent_rewards"], dtype=np.float32)
+            elif isinstance(infos, (list, tuple)) and len(infos) > 0 and "agent_rewards" in infos[0]:
+                agent_rewards_np = np.array([inf["agent_rewards"] for inf in infos], dtype=np.float32)
+            else:
+                agent_rewards_np = np.repeat(
+                    np.array(scalar_reward_np, dtype=np.float32)[:, None], num_agents_per_env, axis=1
+                )
+
             next_done_np = np.logical_or(terms, truncs)
+            rewards[step] = torch.as_tensor(agent_rewards_np, dtype=torch.float32, device=device)
+            next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device).view(
+                num_envs, num_agents_per_env, obs_dim
+            )
+            next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
-            rewards[step] = torch.tensor(reward_np).to(device).flatten()
-            next_obs = torch.Tensor(next_obs_np).to(device)
-            next_done = torch.Tensor(next_done_np).to(device)
-
+        # 2. GAE Advantage Calculation
         with torch.no_grad():
-            _, _, _, next_value = model.get_action_and_value(next_obs)
-            advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
+            _, _, _, next_val_flat = model.get_action_and_value(next_obs.view(-1, obs_dim))
+            next_value = next_val_flat.view(num_envs, num_agents_per_env)
+
+            advantages = torch.zeros_like(rewards, device=device)
+            lastgaelam = torch.zeros((num_envs, num_agents_per_env), device=device)
+
             for t in reversed(range(num_steps)):
                 if t == num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value.flatten()
+                    nextnonterminal = (1.0 - next_done).unsqueeze(1)
+                    nextvalues = next_value
                 else:
-                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextnonterminal = (1.0 - dones[t + 1]).unsqueeze(1)
                     nextvalues = values[t + 1]
+
                 delta = rewards[t] + gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam = (
+                    delta + gamma * gae_lambda * nextnonterminal * lastgaelam
+                )
+
             returns = advantages + values
 
+        # 3. PPO Optimization
         b_obs = obs.reshape((-1, obs_dim))
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1, 2))
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
+
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        b_inds = np.arange(num_steps * num_envs)
+        batch_size = num_steps * num_envs * num_agents_per_env
+        b_inds = np.arange(batch_size)
+
         for _ in range(4):
             np.random.shuffle(b_inds)
-            for start in range(0, len(b_inds), 128):
+            for start in range(0, batch_size, 128):
                 end = start + 128
                 mb_inds = b_inds[start:end]
 
@@ -734,7 +940,7 @@ def train_ppo_league(
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                v_loss = 0.5 * ((newvalue.flatten() - b_returns[mb_inds]) ** 2).mean()
+                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
                 loss = pg_loss - current_ent_coef * entropy.mean() + v_loss
 
                 optimizer.zero_grad()
@@ -742,40 +948,36 @@ def train_ppo_league(
                 nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 optimizer.step()
 
-        # -----------------------------------------------------------------
-        # LEAGUE SYNC MECHANICS
-        # -----------------------------------------------------------------
-        # 1. Update the "Latest" model in the pool so the environments use it
+        # 4. League Pool Updates & Checkpointing
         torch.save(model.state_dict(), os.path.join(pool_dir, "latest.pt"))
 
-        # 2. Save a historical snapshot every 500k steps
         if global_step >= next_history_save:
             torch.save(model.state_dict(), os.path.join(pool_dir, f"history_{global_step}.pt"))
             next_history_save += 500_000
 
-        # 3. Evaluate using evaluate_against_baselines (from previous response)
         if global_step >= next_eval_step:
             next_eval_step += eval_freq
-            from src.rl.trainer import evaluate_against_baselines
-            # Evaluate against the fixed historical Stage 1 and Heuristic
-            metrics = evaluate_against_baselines(
-                model=model,
-                stage1_model=model, # Temporarily use self if no distinct stage1 model passed
+            
+            # Use the new strict gauntlet
+            metrics = evaluate_strict_promotion(
+                current_model=model,
+                best_model=best_model_gatekeeper, 
                 device=device,
-                num_matches=eval_episodes,
-                time_limit=30.0,
+                matches_per_side=eval_episodes // 4, # 15 Red, 15 Blue = 30 matches per opponent
+                time_limit=15.0,
             )
 
-            print(
-                f"\n📊 [EVALUATION @ Step {global_step:7d}] "
-                f"vs Heuristic: Win {metrics['vs_heur_win_rate']:4.1f}% | Loss {metrics['vs_heur_loss_rate']:4.1f}% | Draw {metrics['vs_heur_draw_rate']:4.1f}%"
-            )
+            print(f"\n📊 [STRICT EVAL @ Step {global_step:7d}]")
+            print(f"   Vs Prev Best: {metrics['vs_best_wins']}W - {metrics['vs_best_losses']}L - {metrics['vs_best_draws']}D")
+            print(f"   Vs Heuristic: {metrics['vs_heur_wins']}W - {metrics['vs_heur_losses']}L - {metrics['vs_heur_draws']}D")
 
-            current_score = metrics["vs_heur_win_rate"] - metrics["vs_heur_loss_rate"]
-            if current_score >= best_eval_key:
-                best_eval_key = current_score
-                save_path = os.path.join(save_dir, "best_league_model.pt")
+            if metrics["is_promoted"]:
+                save_path = os.path.join(save_dir, "best_model.pt")
                 torch.save(model.state_dict(), save_path)
-                print(f"   ⭐ New best league model saved: {save_path}")
+                # Promote the gatekeeper to the new weights!
+                best_model_gatekeeper.load_state_dict(model.state_dict())
+                print(f"   ⭐⭐ PROMOTED! New verified best model saved: {save_path} ⭐⭐")
+            else:
+                print(f"   ❌ FAILED PROMOTION. Retaining previous best model.")
 
-    torch.save(model.state_dict(), os.path.join(save_dir, "final_league_model.pt"))
+    torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pt"))

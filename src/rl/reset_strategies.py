@@ -217,3 +217,42 @@ class FixedMultiAgentReset(BaseResetStrategy):
             )
             player.vel = Vec2(0.0, 0.0)
             player.kick_cooldown_timer = 0.0
+
+class TwoVTwoScrambleReset(BaseResetStrategy):
+    """Spawns 1 ST and 1 CB per team in tactically relevant initial zones."""
+    
+    def reset(self, sim: Simulation):
+        p = sim.pitch
+        ball = sim.ball
+        sim.reset_positions()
+
+        if hasattr(sim.mode, "state"):
+            sim.mode.state = "PLAYING"
+            sim.mode.kickoff_timer = 0.0
+
+        # Ball in midfield
+        ball.pos.x = random.uniform(sim.center.x - 150.0, sim.center.x + 150.0)
+        ball.pos.y = random.uniform(p.top + 150.0, p.bottom - 150.0)
+        ball.vel = Vec2(0.0, 0.0)
+
+        # RED TEAM
+        red_st = sim.red_team[0]
+        red_cb = sim.red_team[1]
+        
+        # Red ST spawns near center line
+        red_st.pos = Vec2(sim.center.x - random.uniform(50.0, 200.0), random.uniform(p.top+100, p.bottom-100))
+        # Red CB spawns deep
+        red_cb.pos = Vec2(p.left + random.uniform(100.0, 250.0), random.uniform(p.top+100, p.bottom-100))
+
+        # BLUE TEAM
+        blue_st = sim.blue_team[0]
+        blue_cb = sim.blue_team[1]
+        
+        # Blue ST spawns near center line
+        blue_st.pos = Vec2(sim.center.x + random.uniform(50.0, 200.0), random.uniform(p.top+100, p.bottom-100))
+        # Blue CB spawns deep
+        blue_cb.pos = Vec2(p.right - random.uniform(100.0, 250.0), random.uniform(p.top+100, p.bottom-100))
+
+        for player in sim.all_players:
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0

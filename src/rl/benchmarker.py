@@ -4,37 +4,61 @@ import random
 import time
 from pathlib import Path
 from typing import Any
-from src.engine.modes.base_mode import GameMode
 import torch
 
 from config.match_config import MatchConfig, PlayerSlot, PlayerStats
 from src.engine.controllers import Controller
+from src.engine.modes.base_mode import GameMode
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.modes.drill_mode import SoloDrillMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
+from src.rl.env_wrapper import extract_role_obs
 from src.rl.obs_extractor import extract_universal_obs
 
 
 class RLController(Controller):
-    """Wraps a PyTorch ActorCritic model to act as a standard engine controller."""
+    """Wraps an ActorCritic model to act as a standard engine controller.
 
-    def __init__(self, model, team: str, device="cpu"):
+    Automatically handles both 80-dim base models and 84-dim role models.
+    """
+
+    def __init__(self, model, team: str, device="cpu", role: str = "ST"):
         self.model = model
         self.team = team
         self.device = device
+        self.role = role
         self.model.eval()
+
+        # Automatically detect expected input feature size
+        if hasattr(model, "shared") and len(model.shared) > 0 and hasattr(model.shared[0], "in_features"):
+            self.in_features = model.shared[0].in_features
+        elif hasattr(model, "actor_net") and len(model.actor_net) > 0 and hasattr(model.actor_net[0], "in_features"):
+            self.in_features = model.actor_net[0].in_features
+        else:
+            self.in_features = 80
 
     def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
         player = sim.all_players[player_idx]
-        obs = extract_universal_obs(sim, player, self.team)
+        
+        # Read slot role if available in match config
+        role = self.role
+        if hasattr(sim, "match_config") and sim.match_config and hasattr(sim.match_config, "roster"):
+            if player_idx < len(sim.match_config.roster):
+                role = getattr(sim.match_config.roster[player_idx], "role", self.role)
+
+        # Extract 84-dim or 80-dim obs based on model architecture
+        if self.in_features == 84:
+            obs = extract_role_obs(sim, player, self.team, role)
+        else:
+            obs = extract_universal_obs(sim, player, self.team)
+
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
             action, _, _, _ = self.model.get_action_and_value(obs_tensor, deterministic=True)
 
         act = action.squeeze(0).cpu().numpy()
-        # Move Action
         action_map = {
             0: Vec2(0, 0), 1: Vec2(0, -1), 2: Vec2(0, 1),
             3: Vec2(-1, 0), 4: Vec2(1, 0), 5: Vec2(-1, -1),
@@ -44,7 +68,6 @@ class RLController(Controller):
         kick = bool(act[1])
 
         return move_dir, kick
-
 
 
 def _randomize_solo_positions(sim: Simulation):
