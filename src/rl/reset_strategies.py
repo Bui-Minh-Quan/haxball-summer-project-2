@@ -93,22 +93,127 @@ class ActiveSparringReset(BaseResetStrategy):
                 sim.mode.state = "PLAYING"
                 sim.mode.kickoff_timer = 0.0
 
-            # Ball spawns in midfield / central area
-            ball.pos.x = random.uniform(sim.center.x - 200.0, sim.center.x + 200.0)
+                # Spawn ball centrally
+            ball.pos.x = random.uniform(p.left + 250.0, p.right - 250.0)
             ball.pos.y = random.uniform(p.top + 100.0, p.bottom - 100.0)
             ball.vel = Vec2(0.0, 0.0)
 
-            # Agent spawns on attacking or defensive side of the ball
-            agent_x = max(p.left + 80.0, min(p.right - 80.0, ball.pos.x - random.uniform(60.0, 180.0)))
-            agent_y = random.uniform(p.top + 80.0, p.bottom - 80.0)
-            agent.pos = Vec2(agent_x, agent_y)
-            agent.vel = Vec2(0.0, 0.0)
-            agent.kick_cooldown_timer = 0.0
+            # Randomize agent position in an arc around the ball
+            angle_agent = random.uniform(0.6 * math.pi, 1.4 * math.pi)  # Western arc
+            dist_agent = random.uniform(80.0, 220.0)
+            agent.pos = ball.pos + Vec2(
+                math.cos(angle_agent) * dist_agent,
+                math.sin(angle_agent) * dist_agent,
+            )
 
-            # Bot spawns on the opposing side
-            bot_x = max(p.left + 80.0, min(p.right - 80.0, ball.pos.x + random.uniform(60.0, 220.0)))
-            bot_y = random.uniform(p.top + 80.0, p.bottom - 80.0)
-            bot.pos = Vec2(bot_x, bot_y)
+            # Randomize bot position in an independent arc
+            angle_bot = random.uniform(-0.4 * math.pi, 0.4 * math.pi)  # Eastern arc
+            dist_bot = random.uniform(80.0, 220.0)
+            bot.pos = ball.pos + Vec2(
+                math.cos(angle_bot) * dist_bot, math.sin(angle_bot) * dist_bot
+            )
             bot.vel = Vec2(0.0, 0.0)
             bot.kick_cooldown_timer = 0.0
 
+
+class MultiAgentScrambleReset(BaseResetStrategy):
+    """Fully Symmetric Multi-Agent Reset.
+
+    Randomizes attacking and defending starting arcs evenly between Red and Blue.
+    """
+
+    def reset(self, sim: Simulation):
+        p = sim.pitch
+        ball = sim.ball
+        sim.reset_positions()
+
+        if hasattr(sim.mode, "state"):
+            sim.mode.state = "PLAYING"
+            sim.mode.kickoff_timer = 0.0
+
+        # Spawn ball in central pitch
+        ball.pos.x = random.uniform(p.left + 300.0, p.right - 300.0)
+        ball.pos.y = random.uniform(p.top + 150.0, p.bottom - 150.0)
+        ball.vel = Vec2(0.0, 0.0)
+
+        # 50% chance Red is west/attacker, 50% chance Blue is west/attacker
+        red_is_west = random.random() < 0.5
+
+        angle_west = random.uniform(0.6 * math.pi, 1.4 * math.pi)
+        angle_east = random.uniform(-0.4 * math.pi, 0.4 * math.pi)
+
+        dist_red = random.uniform(90.0, 260.0)
+        dist_blue = random.uniform(90.0, 260.0)
+
+        ang_r = angle_west if red_is_west else angle_east
+        ang_b = angle_east if red_is_west else angle_west
+
+        for player in sim.red_team:
+            pos = ball.pos + Vec2(
+                math.cos(ang_r) * dist_red, math.sin(ang_r) * dist_red
+            )
+            player.pos.x = max(
+                p.left + player.radius, min(p.right - player.radius, pos.x)
+            )
+            player.pos.y = max(
+                p.top + player.radius, min(p.bottom - player.radius, pos.y)
+            )
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0
+
+        for player in sim.blue_team:
+            pos = ball.pos + Vec2(
+                math.cos(ang_b) * dist_blue, math.sin(ang_b) * dist_blue
+            )
+            player.pos.x = max(
+                p.left + player.radius, min(p.right - player.radius, pos.x)
+            )
+            player.pos.y = max(
+                p.top + player.radius, min(p.bottom - player.radius, pos.y)
+            )
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0
+
+
+class FixedMultiAgentReset(BaseResetStrategy):
+    """Deterministic, mirror-symmetric reset for self-play.
+
+    - Ball is placed dead center.
+    - Red and Blue players spawn at identical mirrored offsets.
+    - Works for 1v1 up to N vs M rosters.
+    """
+
+    def __init__(self, offset_x: float = 180.0):
+        self.offset_x = offset_x
+
+    def reset(self, sim: Simulation):
+        p = sim.pitch
+        sim.reset_positions()
+
+        if hasattr(sim.mode, "state"):
+            sim.mode.state = "PLAYING"
+            sim.mode.kickoff_timer = 0.0
+
+        # 1. Ball at dead center
+        sim.ball.pos = sim.center.copy()
+        sim.ball.vel = Vec2(0.0, 0.0)
+
+        # 2. Red Team (Left side)
+        num_red = len(sim.red_team)
+        y_step_red = p.height / (num_red + 1)
+        for i, player in enumerate(sim.red_team):
+            player.pos = Vec2(
+                sim.center.x - self.offset_x, p.top + y_step_red * (i + 1)
+            )
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0
+
+        # 3. Blue Team (Right side, exact mirror)
+        num_blue = len(sim.blue_team)
+        y_step_blue = p.height / (num_blue + 1)
+        for j, player in enumerate(sim.blue_team):
+            player.pos = Vec2(
+                sim.center.x + self.offset_x, p.top + y_step_blue * (j + 1)
+            )
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0
