@@ -3,7 +3,7 @@ import numpy as np
 from src.engine.vector import Vec2
 
 
-def extract_universal_obs(sim, player, team: str, max_teammates: int = 4, max_opponents: int = 5) -> np.ndarray:
+def extract_obs(sim, player, team: str, max_teammates: int = 4, max_opponents: int = 5) -> np.ndarray:
     p = sim.pitch
     ball = sim.ball
     hw, hh = p.width / 2.0, p.height / 2.0
