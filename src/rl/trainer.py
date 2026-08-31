@@ -1,5 +1,4 @@
 import os
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,17 +13,16 @@ from src.engine.vector import Vec2
 from src.rl.env_wrapper import RandomController
 from src.rl.obs_extractor import extract_obs
 from src.rl.reset_strategies import RandomReset
-from src.rl.reward_shapers import DenseReward
+from src.rl.reward_shapers import DenseReward, BallChaserReward
 
 
 class EvalActionPlaceholder(Controller):
-    """Fast placeholder to receive batched actions."""
-
     def __init__(self):
         self.action = (Vec2(0, 0), False)
 
     def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
         return self.action
+
 
 def evaluate_benchmark(
     model: nn.Module,
@@ -35,22 +33,12 @@ def evaluate_benchmark(
     max_steps: int = 1800,
     base_seed: int = 70000,
 ) -> dict:
-    """Batched evaluation: Steps all 50 match seeds simultaneously in lockstep.
-
-    Reduces 90,000 unbatched GPU calls to 1,800 batched GPU calls.
-    """
     model.eval()
 
-    _ACTION_TO_DIR = [
-        Vec2(0, 0),
-        Vec2(0, -1),
-        Vec2(0, 1),
-        Vec2(-1, 0),
-        Vec2(1, 0),
-        Vec2(-1, -1),
-        Vec2(1, -1),
-        Vec2(-1, 1),
-        Vec2(1, 1),
+    _EGO_DIRS = [
+        (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+        (-1.0, 0.0), (1.0, 0.0), (-1.0, -1.0),
+        (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
     ]
 
     half_episodes = num_episodes // 2
@@ -61,8 +49,8 @@ def evaluate_benchmark(
     reset_strats = []
     placeholders = []
     learner_teams = []
+    signs = []
 
-    # 1. Initialize all 50 simulations in parallel
     for i in range(total_episodes):
         is_red = i < half_episodes
         learner_team = "red" if is_red else "blue"
@@ -72,6 +60,7 @@ def evaluate_benchmark(
         ph = EvalActionPlaceholder()
         placeholders.append(ph)
         learner_teams.append(learner_team)
+        signs.append(1.0 if is_red else -1.0)
 
         if baseline_type == "random":
             opp_ctrl = RandomController()
@@ -110,7 +99,6 @@ def evaluate_benchmark(
         reset_strats.append(rs)
         reward_shapers.append(rw)
 
-    # 2. Tracking Buffers
     obs_batch = np.zeros((total_episodes, 80), dtype=np.float32)
     ep_goals_scored = np.zeros(total_episodes, dtype=np.int32)
     ep_goals_conceded = np.zeros(total_episodes, dtype=np.int32)
@@ -119,9 +107,7 @@ def evaluate_benchmark(
 
     dt = 1.0 / 60.0
 
-    # 3. Batched Stepping Loop (Only 1,800 model calls total)
     for step in range(max_steps):
-        # Extract observations for all 50 matches into one batch
         for i in range(total_episodes):
             agent = sims[i].red_team[0] if learner_teams[i] == "red" else sims[i].blue_team[0]
             obs_batch[i] = extract_obs(sims[i], agent, learner_teams[i])
@@ -134,11 +120,14 @@ def evaluate_benchmark(
         actions_np = actions.cpu().numpy()
         truncated = step == (max_steps - 1)
 
-        # Step all simulations
         for i in range(total_episodes):
             m_idx = int(actions_np[i, 0])
             k_val = bool(actions_np[i, 1])
-            placeholders[i].action = (_ACTION_TO_DIR[m_idx], k_val)
+
+            # Apply sign mirroring to transform ego-action to world space
+            ego_x, ego_y = _EGO_DIRS[m_idx]
+            world_move = Vec2(ego_x * signs[i], ego_y)
+            placeholders[i].action = (world_move, k_val)
 
             goal_event = sims[i].step(dt)
             r, _, _ = reward_shapers[i].compute_reward(sims[i], goal_event, truncated)
@@ -157,7 +146,6 @@ def evaluate_benchmark(
 
     model.train()
 
-    # 4. Metric Aggregation
     episodes_with_goals = int(np.sum(ep_goals_scored > 0))
     valid_speeds = [t for t in first_goal_times if t is not None]
     avg_speed = float(np.mean(valid_speeds)) if valid_speeds else 0.0
@@ -180,7 +168,6 @@ def evaluate_benchmark(
     }
 
 
-
 def train_ppo(
     envs,
     model: nn.Module,
@@ -189,8 +176,8 @@ def train_ppo(
     total_timesteps: int = 5_000_000,
     num_envs: int = 16,
     num_steps: int = 256,
-    max_steps: int = 1800,   
-    time_limit: float = 30.0,   
+    max_steps: int = 1800,
+    time_limit: float = 30.0,
     eval_freq: int = 100_000,
     eval_episodes: int = 50,
     save_dir: str = "models/stage1",
@@ -227,8 +214,6 @@ def train_ppo(
     next_eval_step = eval_freq
     next_history_save = 500_000
     batch_size = num_steps * num_envs
-
-    # Initial benchmark to beat
     best_score_key = (-1, -999, -float("inf"))
 
     print(f"🚀 Training: Target [{baseline_type.upper()}] | Batch: {batch_size} | Eval: {eval_episodes} eps")
@@ -239,7 +224,6 @@ def train_ppo(
             param_group["lr"] = lr_initial + progress * (lr_final - lr_initial)
         current_ent = ent_coef_initial + progress * (ent_coef_final - ent_coef_initial)
 
-        # 1. Rollout Collection
         for step in range(num_steps):
             global_step += num_envs
             obs[step] = next_obs
@@ -259,7 +243,6 @@ def train_ppo(
             next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
-        # 2. GAE
         with torch.no_grad():
             _, _, _, next_value = model.get_action_and_value(next_obs)
             advantages = torch.zeros_like(rewards, device=device)
@@ -271,7 +254,6 @@ def train_ppo(
                 advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # 3. PPO Update
         b_obs = obs.reshape((-1, obs_dim))
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1, 2))
@@ -297,10 +279,7 @@ def train_ppo(
                     -mb_advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range),
                 ).mean()
 
-                # Scaled value loss to prevent critic gradient dominance
                 v_loss = 0.5 * 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
-                # Maintain a minimum entropy floor (0.003) so the policy never completely freezes
                 effective_entropy_coef = max(current_ent, 0.003)
                 loss = pg_loss - effective_entropy_coef * entropy.mean() + v_loss
 
@@ -309,14 +288,12 @@ def train_ppo(
                 nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 optimizer.step()
 
-        # Save history for Stage 3 League
         if pool_dir:
             torch.save(model.state_dict(), os.path.join(pool_dir, "latest.pt"))
             if global_step >= next_history_save:
                 torch.save(model.state_dict(), os.path.join(pool_dir, f"history_{global_step}.pt"))
                 next_history_save += 500_000
 
-        # 4. Evaluation & Quantitative Promotion
         if global_step >= next_eval_step:
             next_eval_step += eval_freq
             metrics = evaluate_benchmark(
@@ -324,8 +301,8 @@ def train_ppo(
                 device=device,
                 baseline_type=baseline_type,
                 num_episodes=eval_episodes,
-                time_limit=time_limit,   # Passes the synchronized time_limit
-                max_steps=max_steps,     # Passes the synchronized max_steps
+                time_limit=time_limit,
+                max_steps=max_steps,
             )
 
             pct = (metrics["episodes_with_goals"] / metrics["total_episodes"]) * 100.0
@@ -334,7 +311,6 @@ def train_ppo(
             print(f"   Goals [Scored: {metrics['total_goals_scored']} | Conceded: {metrics['total_goals_conceded']} | Net: {metrics['net_goals']:+d}]")
             print(f"   Avg Speed to 1st Goal: {metrics['avg_speed']:.2f}s | Mean Reward: {metrics['avg_reward']:.2f}")
 
-            # Strict monotonic promotion via score tuple
             if metrics["score_key"] > best_score_key:
                 best_score_key = metrics["score_key"]
                 save_path = os.path.join(save_dir, "best_model.pt")

@@ -20,18 +20,19 @@ from src.rl.reset_strategies import BaseResetStrategy
 class ActionPlaceholder(Controller):
     def __init__(self):
         self.action = (Vec2(0, 0), False)
+
     def get_action(self, player_idx: int, sim) -> tuple[Vec2, bool]:
         return self.action
 
 
 class RandomController(Controller):
-    """Stage 1 Opponent: Moves randomly to act as a dynamic obstacle."""
     def __init__(self):
-        self._action_to_dir = {
-            0: Vec2(0, 0), 1: Vec2(0, -1), 2: Vec2(0, 1),
-            3: Vec2(-1, 0), 4: Vec2(1, 0), 5: Vec2(-1, -1),
-            6: Vec2(1, -1), 7: Vec2(-1, 1), 8: Vec2(1, 1),
-        }
+        self._action_to_dir = [
+            Vec2(0, 0), Vec2(0, -1), Vec2(0, 1),
+            Vec2(-1, 0), Vec2(1, 0), Vec2(-1, -1),
+            Vec2(1, -1), Vec2(-1, 1), Vec2(1, 1),
+        ]
+
     def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
         move = self._action_to_dir[random.randint(0, 8)]
         kick = random.random() < 0.2
@@ -39,7 +40,6 @@ class RandomController(Controller):
 
 
 class PoolController(Controller):
-    """Stage 3 Opponent: 50% Latest Self, 30% Heuristic, 20% Past History."""
     def __init__(self, pool_dir: str, device: str = "cpu"):
         torch.set_num_threads(1)
         self.pool_dir = pool_dir
@@ -49,26 +49,26 @@ class PoolController(Controller):
         self.heuristic_ctrl = HeuristicBotController(TeamHeuristicCoordinator(team="blue"))
         self.current_mode = "heuristic"
         self.is_ready = False
-        
-        self._action_to_dir = {
-            0: Vec2(0, 0), 1: Vec2(0, -1), 2: Vec2(0, 1),
-            3: Vec2(-1, 0), 4: Vec2(1, 0), 5: Vec2(-1, -1),
-            6: Vec2(1, -1), 7: Vec2(-1, 1), 8: Vec2(1, 1),
-        }
+
+        self._ego_dirs = [
+            (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+            (-1.0, 0.0), (1.0, 0.0), (-1.0, -1.0),
+            (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+        ]
 
     def reset_opponent(self):
         os.makedirs(self.pool_dir, exist_ok=True)
         p = random.random()
-        
+
         if p < 0.30:
             self.current_mode = "heuristic"
             self.is_ready = True
             return
-            
+
         self.current_mode = "rl"
         target_file = os.path.join(self.pool_dir, "latest.pt")
-        
-        if p >= 0.80: # Top 20% (0.80 to 1.0)
+
+        if p >= 0.80:
             history_files = glob.glob(os.path.join(self.pool_dir, "history_*.pt"))
             if history_files:
                 target_file = random.choice(history_files)
@@ -92,29 +92,34 @@ class PoolController(Controller):
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
-            action, _, _, _ = self.rl_model.get_action_and_value(obs_tensor)
+            action, _, _, _ = self.rl_model.get_action_and_value(obs_tensor, deterministic=False)
 
         act = action.squeeze(0).cpu().numpy()
-        return self._action_to_dir.get(int(act[0]), Vec2(0, 0)), bool(act[1])
+        m_idx = int(act[0])
+        kick = bool(act[1])
+
+        # Team Blue: sign = -1.0
+        ego_x, ego_y = self._ego_dirs[m_idx]
+        world_move = Vec2(ego_x * -1.0, ego_y)
+        return world_move, kick
 
 
 class MatchEnv(gym.Env):
-    """Episodes run to max_steps with 4-frame action repeat (15 Hz decision rate)."""
-
     def __init__(
         self,
         match_config: MatchConfig,
         reward_shaper: BaseRewardShaper,
         reset_strategy: BaseResetStrategy,
         learner_team: str = "red",
-        max_steps: int = 450,  # 450 decisions * 4 ticks = 1800 simulation steps (30s)
-        frame_skip: int = 4,
+        max_steps: int = 1800,
+        frame_skip: int = 1,
     ):
         super().__init__()
         self.match_config = match_config
         self.reward_shaper = reward_shaper
         self.reset_strategy = reset_strategy
         self.learner_team = learner_team
+        self.sign = 1.0 if learner_team == "red" else -1.0
         self.max_steps = max_steps
         self.frame_skip = frame_skip
         self.current_step = 0
@@ -131,11 +136,11 @@ class MatchEnv(gym.Env):
         )
         self.action_space = spaces.MultiDiscrete([9, 2])
 
-        self._action_to_dir = {
-            0: Vec2(0, 0), 1: Vec2(0, -1), 2: Vec2(0, 1),
-            3: Vec2(-1, 0), 4: Vec2(1, 0), 5: Vec2(-1, -1),
-            6: Vec2(1, -1), 7: Vec2(-1, 1), 8: Vec2(1, 1),
-        }
+        self._ego_dirs = [
+            (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+            (-1.0, 0.0), (1.0, 0.0), (-1.0, -1.0),
+            (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+        ]
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -148,19 +153,19 @@ class MatchEnv(gym.Env):
 
         self.reset_strategy.reset(self.sim)
         self.reward_shaper.reset(self.sim)
-        agent = (
-            self.sim.red_team[0]
-            if self.learner_team == "red"
-            else self.sim.blue_team[0]
-        )
+        agent = self.sim.red_team[0] if self.learner_team == "red" else self.sim.blue_team[0]
         return extract_obs(self.sim, agent, self.learner_team), {}
 
     def step(self, action):
         self.current_step += 1
-        self.rl_controller.action = (
-            self._action_to_dir[int(action[0])],
-            bool(action[1]),
-        )
+
+        # Transform ego action to world movement
+        m_idx = int(action[0])
+        kick_val = bool(action[1])
+        ego_x, ego_y = self._ego_dirs[m_idx]
+        world_move = Vec2(ego_x * self.sign, ego_y)
+
+        self.rl_controller.action = (world_move, kick_val)
 
         accumulated_reward = 0.0
         goal_occurred = False
@@ -174,33 +179,31 @@ class MatchEnv(gym.Env):
                 goal_occurred = True
                 goal_type = step_goal
 
-            r, _, _ = self.reward_shaper.compute_reward(
-                self.sim, step_goal, truncated
-            )
+            r, _, _ = self.reward_shaper.compute_reward(self.sim, step_goal, truncated)
             accumulated_reward += r
 
-            # If a goal happens, break out of frame skip immediately 
-            # to let the agent experience the clean transition.
             if goal_occurred:
                 break
 
         self.episode_reward += accumulated_reward
-        agent = (
-            self.sim.red_team[0]
-            if self.learner_team == "red"
-            else self.sim.blue_team[0]
-        )
+        agent = self.sim.red_team[0] if self.learner_team == "red" else self.sim.blue_team[0]
         obs = extract_obs(self.sim, agent, self.learner_team)
-        
-        # If a goal occurred, we reset the environment for the next step 
-        # while keeping the episode alive (or handling it cleanly).
+
         if goal_occurred:
             self.reset_strategy.reset(self.sim)
             self.reward_shaper.reset(self.sim)
 
         info = {
-            "episode_reward": self.episode_reward,
+            "episode_reward": float(self.episode_reward),
             "goal_event": goal_type,
         }
+
+        agent = (
+            self.sim.red_team[0]
+            if self.learner_team == "red"
+            else self.sim.blue_team[0]
+        )
+
+        obs = extract_obs(self.sim, agent, self.learner_team)
 
         return obs, accumulated_reward, False, truncated, info

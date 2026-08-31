@@ -20,6 +20,19 @@ class RLController(Controller):
         self.deterministic = deterministic
         self.model.eval()
 
+        # Ego-centric directions: index -> (ego_x, ego_y)
+        self._ego_dirs = [
+            (0.0, 0.0),   # 0: None
+            (0.0, -1.0),  # 1: Up
+            (0.0, 1.0),   # 2: Down
+            (-1.0, 0.0),  # 3: Backward
+            (1.0, 0.0),   # 4: Forward
+            (-1.0, -1.0), # 5: Backward-Up
+            (1.0, -1.0),  # 6: Forward-Up
+            (-1.0, 1.0),  # 7: Backward-Down
+            (1.0, 1.0),   # 8: Forward-Down
+        ]
+
     def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
         player = sim.all_players[player_idx]
         obs = extract_obs(sim, player, self.team)
@@ -31,12 +44,15 @@ class RLController(Controller):
             )
 
         act = action.squeeze(0).cpu().numpy()
-        action_map = {
-            0: Vec2(0, 0), 1: Vec2(0, -1), 2: Vec2(0, 1),
-            3: Vec2(-1, 0), 4: Vec2(1, 0), 5: Vec2(-1, -1),
-            6: Vec2(1, -1), 7: Vec2(-1, 1), 8: Vec2(1, 1),
-        }
-        return action_map.get(int(act[0]), Vec2(0, 0)), bool(act[1])
+        m_idx = int(act[0])
+        kick = bool(act[1])
+
+        # Map ego-centric action to world space
+        sign = 1.0 if self.team == "red" else -1.0
+        ego_x, ego_y = self._ego_dirs[m_idx]
+        world_move = Vec2(ego_x * sign, ego_y)
+
+        return world_move, kick
     
 def _randomize_solo_positions(sim: Simulation):
     p = sim.pitch
