@@ -79,7 +79,7 @@ class ActorCritic(nn.Module):
         dist_kick = Categorical(logits=logits_kick)
 
         if action is None:
-            if deterministic:
+            if deterministic and not deterministic:
                 act_m = torch.argmax(logits_move, dim=-1)
                 act_k = torch.argmax(logits_kick, dim=-1)
             else:

@@ -99,27 +99,36 @@ class PoolController(Controller):
 
 
 class MatchEnv(gym.Env):
-    """Episodes run exactly to max_steps. Dynamic team injection."""
-    
-    def __init__(self, match_config: MatchConfig, reward_shaper: BaseRewardShaper, reset_strategy: BaseResetStrategy, learner_team: str = "red", max_steps: int = 600):
+    """Episodes run to max_steps with 4-frame action repeat (15 Hz decision rate)."""
+
+    def __init__(
+        self,
+        match_config: MatchConfig,
+        reward_shaper: BaseRewardShaper,
+        reset_strategy: BaseResetStrategy,
+        learner_team: str = "red",
+        max_steps: int = 450,  # 450 decisions * 4 ticks = 1800 simulation steps (30s)
+        frame_skip: int = 4,
+    ):
         super().__init__()
         self.match_config = match_config
         self.reward_shaper = reward_shaper
         self.reset_strategy = reset_strategy
         self.learner_team = learner_team
         self.max_steps = max_steps
+        self.frame_skip = frame_skip
         self.current_step = 0
         self.episode_reward = 0.0
 
         self.rl_controller = ActionPlaceholder()
-        
-        # Dynamically inject the RL controller into the learner's slot
         for slot in self.match_config.roster:
             if slot.team == self.learner_team and slot.controller == "RL":
                 slot.controller = self.rl_controller
 
         self.sim = Simulation(match_config=self.match_config)
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(80,), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(80,), dtype=np.float32
+        )
         self.action_space = spaces.MultiDiscrete([9, 2])
 
         self._action_to_dir = {
@@ -132,33 +141,66 @@ class MatchEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
         self.episode_reward = 0.0
-        
+
         for slot in self.match_config.roster:
             if isinstance(slot.controller, PoolController):
                 slot.controller.reset_opponent()
-                
+
         self.reset_strategy.reset(self.sim)
         self.reward_shaper.reset(self.sim)
-        agent = self.sim.red_team[0] if self.learner_team == "red" else self.sim.blue_team[0]
+        agent = (
+            self.sim.red_team[0]
+            if self.learner_team == "red"
+            else self.sim.blue_team[0]
+        )
         return extract_obs(self.sim, agent, self.learner_team), {}
 
     def step(self, action):
         self.current_step += 1
-        self.rl_controller.action = (self._action_to_dir[int(action[0])], bool(action[1]))
-        
-        goal_event = self.sim.step(dt=1.0 / 60.0)
+        self.rl_controller.action = (
+            self._action_to_dir[int(action[0])],
+            bool(action[1]),
+        )
+
+        accumulated_reward = 0.0
+        goal_occurred = False
+        goal_type = None
         truncated = self.current_step >= self.max_steps
-        
-        reward, _, info = self.reward_shaper.compute_reward(self.sim, goal_event, truncated)
-        
-        if goal_event is not None:
-            self.reset_strategy.reset(self.sim)
-            self.reward_shaper.reset(self.sim)
-            
-        self.episode_reward += reward
-        info["episode_reward"] = self.episode_reward
-        
-        agent = self.sim.red_team[0] if self.learner_team == "red" else self.sim.blue_team[0]
+        dt = 1.0 / 60.0
+
+        for _ in range(self.frame_skip):
+            step_goal = self.sim.step(dt)
+            if step_goal is not None:
+                goal_occurred = True
+                goal_type = step_goal
+
+            r, _, _ = self.reward_shaper.compute_reward(
+                self.sim, step_goal, truncated
+            )
+            accumulated_reward += r
+
+            # If a goal happens, break out of frame skip immediately 
+            # to let the agent experience the clean transition.
+            if goal_occurred:
+                break
+
+        self.episode_reward += accumulated_reward
+        agent = (
+            self.sim.red_team[0]
+            if self.learner_team == "red"
+            else self.sim.blue_team[0]
+        )
         obs = extract_obs(self.sim, agent, self.learner_team)
         
-        return obs, reward, False, truncated, info
+        # If a goal occurred, we reset the environment for the next step 
+        # while keeping the episode alive (or handling it cleanly).
+        if goal_occurred:
+            self.reset_strategy.reset(self.sim)
+            self.reward_shaper.reset(self.sim)
+
+        info = {
+            "episode_reward": self.episode_reward,
+            "goal_event": goal_type,
+        }
+
+        return obs, accumulated_reward, False, truncated, info

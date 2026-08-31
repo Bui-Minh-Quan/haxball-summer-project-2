@@ -221,4 +221,4 @@ __marimo__/
 training/models/*
 
 # Replay render files
-training/renders/*
+training/render/*
