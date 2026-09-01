@@ -148,3 +148,138 @@ class BallChaserReward(BaseRewardShaper):
             "is_kicking": agent.is_kicking,
         }
         return reward, False, info
+
+
+
+class DenseReward_2(BaseRewardShaper):
+  """Bidirectional Reward:
+
+  - One-time first-touch bonus per kickoff.
+  - Offense: Penalty decreases as ball approaches opponent goal.
+  - Defense: Heavy penalty if ball gets dangerously close to own goal.
+  - Terminal +100 / -100 for match goals.
+  """
+
+  def __init__(
+      self,
+      team: str = "red",
+      first_touch_bonus: float = 10.0,
+      ball_penalty_weight: float = 0.05,
+  ):
+    self.team = team
+    self.first_touch_bonus = first_touch_bonus
+    self.ball_penalty_weight = ball_penalty_weight
+    self.has_touched_ball = False
+
+  def _get_entities_and_goals(self, sim: Simulation):
+    p = sim.pitch
+    is_red = self.team == "red"
+    agent = sim.red_team[0] if is_red else sim.blue_team[0]
+    sign = 1.0 if is_red else -1.0
+
+    opp_goal_x = p.right if is_red else p.left
+    own_goal_x = p.left if is_red else p.right
+    goal_top = p.goal_top
+    goal_bottom = p.goal_bottom
+
+    return agent, opp_goal_x, own_goal_x, goal_top, goal_bottom, sign
+
+  def _dist_to_segment(
+      self, pos: Vec2, goal_x: float, top: float, bottom: float
+  ) -> float:
+    clamped_y = max(top, min(bottom, pos.y))
+    return math.hypot(pos.x - goal_x, pos.y - clamped_y)
+
+  def reset(self, sim: Simulation):
+    self.has_touched_ball = False
+
+  def compute_reward(
+      self, sim: Simulation, goal_event: str | None, truncated: bool
+  ) -> tuple[float, bool, dict]:
+    agent, opp_goal_x, own_goal_x, top, bottom, _ = (
+        self._get_entities_and_goals(sim)
+    )
+    ball = sim.ball
+    p = sim.pitch
+    max_pitch_diag = math.hypot(p.width, p.height)
+
+    # 1. Distances
+    dist_player_to_ball = agent.pos.distance_to(ball.pos)
+    dist_ball_to_opp_goal = self._dist_to_segment(
+        ball.pos, opp_goal_x, top, bottom
+    )
+    dist_ball_to_own_goal = self._dist_to_segment(
+        ball.pos, own_goal_x, top, bottom
+    )
+
+    # 2. Offensive Penalty: 0.0 at opponent line, negative further away
+    reward = (
+        -(dist_ball_to_opp_goal / max_pitch_diag) * self.ball_penalty_weight
+    )
+
+    # 3. Defensive Danger Penalty: Extra penalty if ball is in our defensive danger zone (< 300px)
+    if dist_ball_to_own_goal < 300.0:
+      defense_penalty = (
+          1.0 - (dist_ball_to_own_goal / 300.0)
+      ) * 0.04  # Up to -0.04/tick
+      reward -= defense_penalty
+
+    # 4. First Touch Bounty
+    touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 4.0
+    if not self.has_touched_ball and dist_player_to_ball <= touch_reach:
+      reward += self.first_touch_bonus
+      self.has_touched_ball = True
+
+    # 5. Terminal Match Events
+    if goal_event == f"{self.team}_goal":
+      reward += 100.0
+      self.has_touched_ball = False
+    elif goal_event is not None:
+      reward -= 100.0
+      self.has_touched_ball = False
+
+    return reward, False, {"goal_event": goal_event}
+
+
+
+class MinimalistAsymmetricReward(BaseRewardShaper):
+    """Simplest baseline:
+    - Pure ball-to-goal continuous distance penalty.
+    - Asymmetric goals (+100 scored / -50 conceded) to maintain aggressive offensive courage.
+    """
+
+    def __init__(self, team: str = "red", ball_penalty_weight: float = 0.05):
+        self.team = team
+        self.ball_penalty_weight = ball_penalty_weight
+
+    def _get_opp_goal(self, sim: Simulation):
+        p = sim.pitch
+        is_red = self.team == "red"
+        opp_goal_x = p.right if is_red else p.left
+        return opp_goal_x, p.goal_top, p.goal_bottom
+
+    def _dist_to_segment(self, pos: Vec2, goal_x: float, top: float, bottom: float) -> float:
+        clamped_y = max(top, min(bottom, pos.y))
+        return math.hypot(pos.x - goal_x, pos.y - clamped_y)
+
+    def reset(self, sim: Simulation):
+        pass
+
+    def compute_reward(
+        self, sim: Simulation, goal_event: str | None, truncated: bool
+    ) -> tuple[float, bool, dict]:
+        opp_goal_x, top, bottom = self._get_opp_goal(sim)
+        ball = sim.ball
+        max_diag = math.hypot(sim.pitch.width, sim.pitch.height)
+
+        # 1. Distance penalty (0.0 at goal mouth, down to -0.05 at opposite end)
+        dist_ball_goal = self._dist_to_segment(ball.pos, opp_goal_x, top, bottom)
+        #reward = -(dist_ball_goal / max_diag) * self.ball_penalty_weight
+        reward = -self.ball_penalty_weight
+        # 2. Asymmetric Terminal Events
+        if goal_event == f"{self.team}_goal":
+            reward += 100.0
+        elif goal_event is not None:
+            reward -= 50.0  # Reduced penalty prevents conservative freezing
+
+        return reward, False, {"dist_ball_goal": dist_ball_goal, "goal_event": goal_event}

@@ -39,6 +39,23 @@ class RandomController(Controller):
         return move, kick
 
 
+class Stage2OpponentController(Controller):
+  """Smooth curriculum: 90% Heuristic, 10% Random."""
+
+  def __init__(self, team: str = "blue"):
+    self.heuristic = HeuristicBotController(TeamHeuristicCoordinator(team=team))
+    self.random = RandomController()
+    self.is_heuristic = True
+
+  def reset_opponent(self):
+    self.is_heuristic = random.random() < 0.90
+
+  def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
+    if self.is_heuristic:
+      return self.heuristic.get_action(player_idx, sim)
+    return self.random.get_action(player_idx, sim)
+
+
 class PoolController(Controller):
     def __init__(self, pool_dir: str, device: str = "cpu"):
         torch.set_num_threads(1)
@@ -148,7 +165,7 @@ class MatchEnv(gym.Env):
         self.episode_reward = 0.0
 
         for slot in self.match_config.roster:
-            if isinstance(slot.controller, PoolController):
+            if hasattr(slot.controller, "reset_opponent"):
                 slot.controller.reset_opponent()
 
         self.reset_strategy.reset(self.sim)
