@@ -154,13 +154,13 @@ def evaluate_benchmark(
     net_goals = total_scored - total_conceded
     avg_reward = float(np.mean(ep_rewards))
 
-    score_key = (episodes_with_goals, net_goals, round(avg_reward, 2))
+    score_key = (net_goals, episodes_with_goals, total_scored, round(avg_reward, 2))
 
     return {
+        "net_goals": net_goals,
         "episodes_with_goals": episodes_with_goals,
         "total_goals_scored": total_scored,
         "total_goals_conceded": total_conceded,
-        "net_goals": net_goals,
         "avg_speed": avg_speed,
         "avg_reward": avg_reward,
         "score_key": score_key,

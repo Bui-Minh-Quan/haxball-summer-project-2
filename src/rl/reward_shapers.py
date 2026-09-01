@@ -18,75 +18,90 @@ class BaseRewardShaper(ABC):
         pass
 
 class DenseReward(BaseRewardShaper):
-    """Continuous distance-penalty reward with goal-segment projection."""
+  """1.
 
-    def __init__(self, team: str = "red"):
-        self.team = team
+  First-touch reward: Granted strictly once per kickoff/reset to initiate
+  play. 2. Continuous Ball-to-Goal penalty: Ranges from 0.0 at the goal line
+  down to -0.05 at opposite net. 3. Terminal Match Events: +100 for scored goal,
+  -100 for conceded goal.
+  """
 
-    def _get_entities_and_goal(self, sim: Simulation):
-        p = sim.pitch
-        is_red = self.team == "red"
-        agent = sim.red_team[0] if is_red else sim.blue_team[0]
-        sign = 1.0 if is_red else -1.0
-        
-        # Opponent goal line segment
-        opp_goal_x = p.right if is_red else p.left
-        goal_top = p.goal_top
-        goal_bottom = p.goal_bottom
+  def __init__(
+      self,
+      team: str = "red",
+      first_touch_bonus: float = 10.0,
+      ball_penalty_weight: float = 0.05,
+  ):
+    self.team = team
+    self.first_touch_bonus = first_touch_bonus
+    self.ball_penalty_weight = ball_penalty_weight
+    self.has_touched_ball = False
 
-        return agent, opp_goal_x, goal_top, goal_bottom, sign
+  def _get_entities_and_goal(self, sim: Simulation):
+    p = sim.pitch
+    is_red = self.team == "red"
+    agent = sim.red_team[0] if is_red else sim.blue_team[0]
+    sign = 1.0 if is_red else -1.0
 
-    def _dist_to_goal_segment(self, pos: Vec2, goal_x: float, top: float, bottom: float) -> float:
-        clamped_y = max(top, min(bottom, pos.y))
-        dx = pos.x - goal_x
-        dy = pos.y - clamped_y
-        return math.hypot(dx, dy)
+    opp_goal_x = p.right if is_red else p.left
+    goal_top = p.goal_top
+    goal_bottom = p.goal_bottom
 
-    def reset(self, sim: Simulation):
-        pass
+    return agent, opp_goal_x, goal_top, goal_bottom, sign
 
-    def compute_reward(
-        self, sim: Simulation, goal_event: str | None, truncated: bool
-    ) -> tuple[float, bool, dict]:
-        agent, opp_goal_x, goal_top, goal_bottom, sign = self._get_entities_and_goal(sim)
-        ball = sim.ball
-        p = sim.pitch
-        max_pitch_diag = math.hypot(p.width, p.height)
+  def _dist_to_goal_segment(
+      self, pos: Vec2, goal_x: float, top: float, bottom: float
+  ) -> float:
+    clamped_y = max(top, min(bottom, pos.y))
+    dx = pos.x - goal_x
+    dy = pos.y - clamped_y
+    return math.hypot(dx, dy)
 
-        # 1. Exact geometric distances
-        dist_player_to_ball = agent.pos.distance_to(ball.pos)
-        dist_ball_to_goal = self._dist_to_goal_segment(ball.pos, opp_goal_x, goal_top, goal_bottom)
+  def reset(self, sim: Simulation):
+    self.has_touched_ball = False
 
-        # 2. Normalized Continuous Distance Penalties (Always <= 0)
-        # Player pursuit penalty: 0.0 at touch, up to -0.05 at max range
-        player_penalty = -(dist_player_to_ball / max_pitch_diag) * 0.05
-        
-        # Ball-to-Goal penalty: 0.0 inside net, up to -0.10 at opposite net
-        ball_penalty = -(dist_ball_to_goal / max_pitch_diag) * 0.10
+  def compute_reward(
+      self, sim: Simulation, goal_event: str | None, truncated: bool
+  ) -> tuple[float, bool, dict]:
+    agent, opp_goal_x, goal_top, goal_bottom, _ = (
+        self._get_entities_and_goal(sim)
+    )
+    ball = sim.ball
+    p = sim.pitch
+    max_pitch_diag = math.hypot(p.width, p.height)
 
-        reward = player_penalty + ball_penalty
+    # 1. Distances
+    dist_player_to_ball = agent.pos.distance_to(ball.pos)
+    dist_ball_to_goal = self._dist_to_goal_segment(
+        ball.pos, opp_goal_x, goal_top, goal_bottom
+    )
 
-        # 3. Touch and Forward Strike Bonus
-        touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 4.0
-        if dist_player_to_ball <= touch_reach:
-            # Physical touch maintenance
-            reward += 0.02
-            # Forward kick bonus (positive velocity toward target goal)
-            if agent.is_kicking and (ball.vel.x * sign) > 100.0:
-                reward += 1.5
+    # 2. Continuous Ball-to-Goal Penalty (Closer to net = less penalty)
+    # At goal line = 0.0, at opposite end ≈ -0.05 per tick
+    ball_penalty = -(dist_ball_to_goal / max_pitch_diag) * self.ball_penalty_weight
+    reward = ball_penalty
 
-        # 4. Match Terminal Events
-        if goal_event == f"{self.team}_goal":
-            reward += 200.0
-        elif goal_event is not None:
-            reward -= 200.0
+    # 3. First Touch Bonus (Triggered once per reset/kickoff)
+    touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 4.0
+    if not self.has_touched_ball and dist_player_to_ball <= touch_reach:
+      reward += self.first_touch_bonus
+      self.has_touched_ball = True
 
-        info = {
-            "dist_player_ball": dist_player_to_ball,
-            "dist_ball_goal": dist_ball_to_goal,
-            "goal_event": goal_event,
-        }
-        return reward, False, info
+    # 4. Terminal Match Goals
+    if goal_event == f"{self.team}_goal":
+      reward += 100.0
+      self.has_touched_ball = False
+    elif goal_event is not None:
+      reward -= 100.0
+      self.has_touched_ball = False
+
+    info = {
+        "dist_player_ball": dist_player_to_ball,
+        "dist_ball_goal": dist_ball_to_goal,
+        "has_touched": self.has_touched_ball,
+        "goal_event": goal_event,
+    }
+    return reward, False, info
 
 
 class BallChaserReward(BaseRewardShaper):
