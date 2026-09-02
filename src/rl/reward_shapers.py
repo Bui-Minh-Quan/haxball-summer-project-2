@@ -299,4 +299,64 @@ class DenseReward_3(BaseRewardShaper):
     return reward, False, {"goal_event": goal_event}
 
 
+class DenseReward_4(BaseRewardShaper):
+    """Team-Based MARL Reward:
+    - Territory: Advantage delta based on (Distance to Own Goal - Distance to Opp Goal).
+    - Score State: Escalating penalty for tied games or trailing teams.
+    - Spacing: Minor penalty if teammates cluster too closely.
+    - Shared Goals: +/- 100 applied uniformly to the whole team.
+    """
+    def __init__(self, team: str = "red"):
+        self.team = team
+        self.prev_terr_adv = 0.0
+
+    def _get_territory_advantage(self, sim: Simulation) -> float:
+        p = sim.pitch
+        ball_pos = sim.ball.pos
+        
+        # Distance to goals
+        d_red = math.hypot(ball_pos.x - p.left, ball_pos.y - p.center_y)
+        d_blue = math.hypot(ball_pos.x - p.right, ball_pos.y - p.center_y)
+        
+        adv = (d_red - d_blue) if self.team == "red" else (d_blue - d_red)
+        return adv
+
+    def reset(self, sim: Simulation):
+        self.prev_terr_adv = self._get_territory_advantage(sim)
+
+    def compute_reward(self, sim: Simulation, goal_event: str | None, truncated: bool) -> tuple[float, bool, dict]:
+        reward = 0.0
+        
+        # 1. Zero-Sum Territory Advantage Delta
+        curr_terr_adv = self._get_territory_advantage(sim)
+        delta_adv = curr_terr_adv - self.prev_terr_adv
+        reward += delta_adv * 0.04
+        self.prev_terr_adv = curr_terr_adv
+
+        # 2. Score State Penalty (Urgency mechanic)
+        score_us = sim.score_red if self.team == "red" else sim.score_blue
+        score_them = sim.score_blue if self.team == "red" else sim.score_red
+        
+        if score_us <= score_them:
+            # Punish ties and trailing. Penalty scales gently with time.
+            reward -= 0.01 
+
+        # 3. Spatial Dispersion (Anti-Clustering)
+        teammates = sim.red_team if self.team == "red" else sim.blue_team
+        cluster_penalty = 0.0
+        for i in range(len(teammates)):
+            for j in range(i + 1, len(teammates)):
+                dist = teammates[i].pos.distance_to(teammates[j].pos)
+                if dist < 60.0:
+                    cluster_penalty -= 0.005
+        reward += cluster_penalty
+
+        # 4. Shared Terminal Goals
+        if goal_event == f"{self.team}_goal":
+            reward += 100.0
+        elif goal_event is not None:
+            reward -= 100.0
+
+        return reward, False, {"goal_event": goal_event}
+
 
