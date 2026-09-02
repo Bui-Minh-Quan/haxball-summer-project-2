@@ -150,7 +150,6 @@ class BallChaserReward(BaseRewardShaper):
         return reward, False, info
 
 
-
 class DenseReward_2(BaseRewardShaper):
   """Bidirectional Reward:
 
@@ -241,45 +240,63 @@ class DenseReward_2(BaseRewardShaper):
     return reward, False, {"goal_event": goal_event}
 
 
+class DenseReward_3(BaseRewardShaper):
+  """Zero-Sum Symmetrical Reward for Self-Play:
 
-class MinimalistAsymmetricReward(BaseRewardShaper):
-    """Simplest baseline:
-    - Pure ball-to-goal continuous distance penalty.
-    - Asymmetric goals (+100 scored / -50 conceded) to maintain aggressive offensive courage.
-    """
+  - Prevents reward farming/collusion (Red's gain is Blue's loss).
+  - Contested first touch bounty (+5.0 to whoever wins kickoff race).
+  - Territory advancement: Continuous push toward opponent end.
+  - Goals: +100 / -100.
+  """
 
-    def __init__(self, team: str = "red", ball_penalty_weight: float = 0.05):
-        self.team = team
-        self.ball_penalty_weight = ball_penalty_weight
+  def __init__(
+      self,
+      team: str = "red",
+      first_touch_bonus: float = 5.0,
+      territory_weight: float = 0.04,
+  ):
+    self.team = team
+    self.first_touch_bonus = first_touch_bonus
+    self.territory_weight = territory_weight
+    self.prev_ball_x = 0.0
+    self.first_touch_claimed = False
 
-    def _get_opp_goal(self, sim: Simulation):
-        p = sim.pitch
-        is_red = self.team == "red"
-        opp_goal_x = p.right if is_red else p.left
-        return opp_goal_x, p.goal_top, p.goal_bottom
+  def reset(self, sim: Simulation):
+    self.prev_ball_x = sim.ball.pos.x
+    self.first_touch_claimed = False
 
-    def _dist_to_segment(self, pos: Vec2, goal_x: float, top: float, bottom: float) -> float:
-        clamped_y = max(top, min(bottom, pos.y))
-        return math.hypot(pos.x - goal_x, pos.y - clamped_y)
+  def compute_reward(
+      self, sim: Simulation, goal_event: str | None, truncated: bool
+  ) -> tuple[float, bool, dict]:
+    p = sim.pitch
+    ball = sim.ball
+    is_red = self.team == "red"
+    agent = sim.red_team[0] if is_red else sim.blue_team[0]
+    sign = 1.0 if is_red else -1.0
 
-    def reset(self, sim: Simulation):
-        pass
+    reward = 0.0
 
-    def compute_reward(
-        self, sim: Simulation, goal_event: str | None, truncated: bool
-    ) -> tuple[float, bool, dict]:
-        opp_goal_x, top, bottom = self._get_opp_goal(sim)
-        ball = sim.ball
-        max_diag = math.hypot(sim.pitch.width, sim.pitch.height)
+    # 1. Contested First Touch Bounty (Only 1 player can claim it per kickoff)
+    touch_reach = agent.radius + ball.radius + agent.stats.kick_margin + 4.0
+    if not self.first_touch_claimed and agent.pos.distance_to(ball.pos) <= touch_reach:
+      reward += self.first_touch_bonus
+      self.first_touch_claimed = True
 
-        # 1. Distance penalty (0.0 at goal mouth, down to -0.05 at opposite end)
-        dist_ball_goal = self._dist_to_segment(ball.pos, opp_goal_x, top, bottom)
-        #reward = -(dist_ball_goal / max_diag) * self.ball_penalty_weight
-        reward = -self.ball_penalty_weight
-        # 2. Asymmetric Terminal Events
-        if goal_event == f"{self.team}_goal":
-            reward += 100.0
-        elif goal_event is not None:
-            reward -= 50.0  # Reduced penalty prevents conservative freezing
+    # 2. Zero-Sum Ball Territory Advancement (X-axis displacement)
+    # Moving ball rightward: +delta for Red, -delta for Blue
+    delta_x = (ball.pos.x - self.prev_ball_x) * sign
+    reward += delta_x * self.territory_weight
 
-        return reward, False, {"dist_ball_goal": dist_ball_goal, "goal_event": goal_event}
+    # 3. Terminal Goal Events
+    if goal_event == f"{self.team}_goal":
+      reward += 100.0
+      self.first_touch_claimed = False
+    elif goal_event is not None:
+      reward -= 100.0
+      self.first_touch_claimed = False
+
+    self.prev_ball_x = ball.pos.x
+    return reward, False, {"goal_event": goal_event}
+
+
+
