@@ -406,17 +406,24 @@ def train_ppo(
                     f"Win Rate: {metrics_vs_best['win_rate']*100:.1f}%"
                 )
 
-                # Dethrone only on statistically decisive victory
-                dethroned_champion = (
-                    metrics_vs_best["net_goals"] >= 6 and
-                    metrics_vs_best["win_rate"] >= 0.4
-                )
+                # Track explicit criteria failures against the champion
+                champ_failed_reasons = []
+                if metrics_vs_best["net_goals"] < 6:
+                    champ_failed_reasons.append(f"Net Goals: {metrics_vs_best['net_goals']:+d} < +6")
+                if metrics_vs_best["win_rate"] < 0.30:
+                    champ_failed_reasons.append(f"Win Rate: {metrics_vs_best['win_rate']*100:.1f}% < 30.0%")
+
+                dethroned_champion = (len(champ_failed_reasons) == 0)
 
                 if dethroned_champion:
                     save_path = os.path.join(save_dir, "best_model.pt")
                     torch.save(model.state_dict(), save_path)
                     eval_opp_model.load_state_dict(model.state_dict())
-                    print(f"   ⭐⭐ PROMOTED! Decisively defeated Champion (Net: {metrics_vs_best['net_goals']:+d}) -> Saved: {save_path}")
+                    print(
+                        f"   ⭐⭐ PROMOTED! Decisively defeated Champion "
+                        f"(Net: {metrics_vs_best['net_goals']:+d} | Win Rate: {metrics_vs_best['win_rate']*100:.1f}%) "
+                        f"-> Saved: {save_path}"
+                    )
 
                     # 3. EVENT-DRIVEN POOL SNAPSHOT (Only added when champion is defeated)
                     if pool_dir:
@@ -424,7 +431,8 @@ def train_ppo(
                         torch.save(model.state_dict(), history_path)
                         print(f"   📦 POOL UPDATED: Added new champion generation -> {history_path}")
                 else:
-                    print(f"   ❌ RETAINING CHAMPION. Margin not decisive enough (Net: {metrics_vs_best['net_goals']:+d} < +6).")
+                    reason_str = " | ".join(champ_failed_reasons)
+                    print(f"   ❌ RETAINING CHAMPION [{reason_str}].")
 
             else:
                 # Fallback for Stage 1 / Stage 2 single-baseline training
