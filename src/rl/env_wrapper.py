@@ -2,6 +2,7 @@ import os
 import glob
 import random
 import torch
+import torch.nn as nn
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -57,7 +58,7 @@ class Stage2OpponentController(Controller):
 
 
 class PoolController(Controller):
-    def __init__(self, pool_dir: str, team: str = "blue", device: str = "cpu"):
+    def __init__(self, pool_dir: str, team: str = "blue", device: str = "cpu", heuristic_pct: float = 0.3):
         torch.set_num_threads(1)
         self.pool_dir = pool_dir
         self.team = team
@@ -70,6 +71,7 @@ class PoolController(Controller):
         )
         self.current_mode = "heuristic"
         self.is_ready = False
+        self.heuristic_pct = heuristic_pct
 
         self._ego_dirs = [
             (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
@@ -81,7 +83,7 @@ class PoolController(Controller):
         os.makedirs(self.pool_dir, exist_ok=True)
         p = random.random()
 
-        if p < 0.30:
+        if p < self.heuristic_pct:
             self.current_mode = "heuristic"
             self.is_ready = True
             return
@@ -109,7 +111,8 @@ class PoolController(Controller):
             return self.heuristic_ctrl.get_action(player_idx, sim)
 
         player = sim.all_players[player_idx]
-        obs = extract_obs(sim, player, team="blue")
+        
+        obs = extract_obs(sim, player, team=self.team)
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
@@ -119,11 +122,48 @@ class PoolController(Controller):
         m_idx = int(act[0])
         kick = bool(act[1])
 
-        # Team Blue: sign = -1.0
+
         ego_x, ego_y = self._ego_dirs[m_idx]
-        world_move = Vec2(ego_x * -1.0, ego_y)
+        world_move = Vec2(ego_x * self.sign, ego_y)
         return world_move, kick
 
+
+class MultiAgentRLController(Controller):
+    """Multi-agent controller that resolves observations dynamically for any assigned slot."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        team: str,
+        device: torch.device,
+        deterministic: bool = True,
+    ):
+        self.model = model
+        self.team = team
+        self.device = device
+        self.deterministic = deterministic
+        self.sign = 1.0 if team == "red" else -1.0
+        self._ego_dirs = [
+            (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+            (-1.0, 0.0), (1.0, 0.0), (-1.0, -1.0),
+            (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+        ]
+
+    def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
+        player = sim.all_players[player_idx]
+        obs = extract_obs(sim, player, team=self.team)
+        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            action, _, _, _ = self.model.get_action_and_value(
+                obs_tensor, deterministic=self.deterministic
+            )
+
+        act = action.squeeze(0).cpu().numpy()
+        m_idx = int(act[0])
+        kick = bool(act[1])
+        ego_x, ego_y = self._ego_dirs[m_idx]
+        return Vec2(ego_x * self.sign, ego_y), kick
 
 class MatchEnv(gym.Env):
     def __init__(
@@ -135,7 +175,6 @@ class MatchEnv(gym.Env):
         max_steps: int = 1800,
     ):
         self.match_config = match_config
-        self.sim = Simulation(match_config)
         self.reward_shaper = reward_shaper
         self.reset_strategy = reset_strategy
         self.learner_team = learner_team
@@ -148,16 +187,29 @@ class MatchEnv(gym.Env):
             (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
         ]
 
-        # Identify active learner slots and inject ActionPlaceholder ONCE
+        # 1. Replace "RL" strings with ActionPlaceholder BEFORE initializing Simulation
         self.learner_slots = []
         for i, slot in enumerate(match_config.roster):
             if slot.team == learner_team and slot.controller == "RL":
                 slot.controller = ActionPlaceholder()
                 self.learner_slots.append((i, slot))
-                
+
         self.num_learners = len(self.learner_slots)
-        
-        # Adjust Gym spaces based on team size
+
+        # 2. Initialize Simulation with valid controller instances
+        pw = getattr(match_config, "pitch_width", 840.0)
+        ph = getattr(match_config, "pitch_height", 480.0)
+        self.sim = Simulation(match_config=match_config, center_x=pw / 2.0, center_y=ph / 2.0)
+
+        # 3. Ensure player instances inside sim reference the placeholders directly
+        team_roster = [s for s in match_config.roster if s.team == self.learner_team]
+        for roster_idx, slot in self.learner_slots:
+            player_idx_in_team = team_roster.index(slot)
+            agent = self.sim.red_team[player_idx_in_team] if self.learner_team == "red" else self.sim.blue_team[player_idx_in_team]
+            if hasattr(agent, "controller"):
+                agent.controller = slot.controller
+
+        # 4. Adjust Gym spaces based on team size
         obs_dim = 80
         if self.num_learners == 1:
             self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
@@ -165,7 +217,6 @@ class MatchEnv(gym.Env):
         else:
             self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_learners, obs_dim), dtype=np.float32)
             self.action_space = spaces.MultiDiscrete([[9, 2]] * self.num_learners)
-
 
     def _get_obs(self):
         obs_list = []
@@ -195,7 +246,7 @@ class MatchEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
-        # Route actions to the correct learner slots
+    # Route actions to the correct learner slots
         if self.num_learners == 1:
             action = [action]
 
@@ -205,8 +256,8 @@ class MatchEnv(gym.Env):
             ego_x, ego_y = self._EGO_DIRS[m_idx]
             sign = 1.0 if self.learner_team == "red" else -1.0
             world_move = Vec2(ego_x * sign, ego_y)
-            
-            # Update the pre-existing placeholder
+
+            # Update the placeholder controller
             slot.controller.action = (world_move, k_val)
 
         goal_event = self.sim.step(1.0 / 60.0)
@@ -214,18 +265,15 @@ class MatchEnv(gym.Env):
 
         obs = self._get_obs()
         truncated = self.current_step >= self.max_steps
-        
-        # Shared Team Reward
+
+        # Shared Team Reward (returns a scalar float)
         reward, terminated, info = self.reward_shaper.compute_reward(
             self.sim, goal_event, truncated
         )
-
-        # Distribute shared reward to all agents
-        if self.num_learners > 1:
-            reward = np.full(self.num_learners, reward, dtype=np.float32)
 
         if goal_event is not None or truncated:
             self.reset_strategy.reset(self.sim)
             self.reward_shaper.reset(self.sim)
 
-        return obs, reward, terminated, truncated, info
+        # Strictly return a scalar float for reward
+        return obs, float(reward), bool(terminated), bool(truncated), info

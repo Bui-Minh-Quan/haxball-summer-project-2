@@ -66,13 +66,11 @@ def evaluate_team(
         signs.append(1.0 if is_red else -1.0)
 
         roster = []
-        # Populate Learners
         for p in range(team_size):
             ph = EvalActionPlaceholder()
             learner_placeholders[i].append(ph)
             roster.append(PlayerSlot(learner_team, PlayerStats(f"L{p}", accel=3200.0), ph))
-        
-        # Populate Opponents
+
         if is_model_baseline:
             for p in range(team_size):
                 o_ph = EvalActionPlaceholder()
@@ -100,20 +98,22 @@ def evaluate_team(
 
     ep_goals_scored = np.zeros(total_episodes, dtype=np.int32)
     ep_goals_conceded = np.zeros(total_episodes, dtype=np.int32)
+    ep_rewards = np.zeros(total_episodes, dtype=np.float32)
 
     dt = 1.0 / 60.0
 
     for step in range(max_steps):
+        truncated = step == (max_steps - 1)
         idx_l = 0
         idx_o = 0
         for i in range(total_episodes):
             l_squad = sims[i].red_team if learner_teams[i] == "red" else sims[i].blue_team
             o_squad = sims[i].blue_team if learner_teams[i] == "red" else sims[i].red_team
-            
+
             for agent in l_squad:
                 obs_batch_learner[idx_l] = extract_obs(sims[i], agent, learner_teams[i])
                 idx_l += 1
-                
+
             if is_model_baseline:
                 for agent in o_squad:
                     obs_batch_opp[idx_o] = extract_obs(sims[i], agent, opp_teams[i])
@@ -141,29 +141,39 @@ def evaluate_team(
                     opp_placeholders[i][p].action = (Vec2(ego_x_o * -signs[i], ego_y_o), bool(actions_np_o[i, p, 1]))
 
             goal_event = sims[i].step(dt)
+
+            # Compute reward tracking for the episode
+            r, _, _ = reward_shapers[i].compute_reward(sims[i], goal_event, truncated)
+            ep_rewards[i] += r
+
             if goal_event == f"{learner_teams[i]}_goal":
                 ep_goals_scored[i] += 1
                 reset_strats[i].reset(sims[i])
+                reward_shapers[i].reset(sims[i])
             elif goal_event is not None:
                 ep_goals_conceded[i] += 1
                 reset_strats[i].reset(sims[i])
+                reward_shapers[i].reset(sims[i])
 
     model.train()
     total_scored = int(np.sum(ep_goals_scored))
     total_conceded = int(np.sum(ep_goals_conceded))
+    scored_matches = int(np.sum(ep_goals_scored > 0))
     wins = int(np.sum(ep_goals_scored > ep_goals_conceded))
     losses = int(np.sum(ep_goals_scored < ep_goals_conceded))
-    
+
     return {
         "net_goals": total_scored - total_conceded,
+        "total_scored": total_scored,
+        "total_conceded": total_conceded,
+        "scored_matches": scored_matches,
+        "mean_reward": float(np.mean(ep_rewards)),
         "wins": wins,
         "losses": losses,
         "win_rate": wins / total_episodes,
         "loss_rate": losses / total_episodes,
         "total_episodes": total_episodes,
     }
-
-
 
 def train_team_ppo(
     envs,
@@ -202,6 +212,9 @@ def train_team_ppo(
         else:
             eval_opp_model.load_state_dict(model.state_dict())
         eval_opp_model.eval()
+
+    # Tracking best heuristic metrics
+    best_heuristic_score = (-float("inf"), -float("inf"), -float("inf"), -float("inf"))
 
     optimizer = optim.Adam(model.parameters(), lr=lr_initial, eps=1e-5)
 
@@ -250,10 +263,22 @@ def train_team_ppo(
             next_obs_np, reward_np, terms, truncs, _ = envs.step(env_action)
             next_done_np = np.logical_or(terms, truncs)
 
+            # Repeat scalar team reward across all agents on the team (16 -> 32)
+            if reward_np.size == num_envs:
+              reward_np = np.repeat(reward_np, team_size)
+
             # Flatten transitions back into IPPO buffer
-            rewards[step] = torch.as_tensor(reward_np.reshape(-1), dtype=torch.float32, device=device)
-            next_obs = torch.as_tensor(next_obs_np.reshape(-1, 80), dtype=torch.float32, device=device)
-            next_done = torch.as_tensor(next_done_np.repeat(team_size), dtype=torch.float32, device=device)
+            rewards[step] = torch.as_tensor(
+                reward_np.reshape(-1), dtype=torch.float32, device=device
+            )
+            next_obs = torch.as_tensor(
+                next_obs_np.reshape(-1, 80), dtype=torch.float32, device=device
+            )
+            next_done = torch.as_tensor(
+                next_done_np.repeat(team_size),
+                dtype=torch.float32,
+                device=device,
+            )
 
         # 2. Generalized Advantage Estimation (GAE) across all agents
         with torch.no_grad():
@@ -322,66 +347,129 @@ def train_team_ppo(
             )
 
             wr_heu = metrics_heu["win_rate"] * 100.0
-            print(f"   Win Rate: {wr_heu:.1f}% | Net Goals: {metrics_heu['net_goals']:+d} | Wins: {metrics_heu['wins']}/{metrics_heu['total_episodes']}")
+            scored_matches = metrics_heu["scored_matches"]
+            net_heu = metrics_heu["net_goals"]
+            reward_heu = metrics_heu["mean_reward"]
 
-            # Pass 1: Heuristic Sanity Check Guardrail
-            guardrail_failures = []
-            if metrics_heu["win_rate"] < 0.80:
-                guardrail_failures.append(f"Win Rate: {wr_heu:.1f}% < 80.0%")
-            if metrics_heu["net_goals"] <= 0:
-                guardrail_failures.append(f"Net Goals: {metrics_heu['net_goals']:+d} ≤ 0")
+            goals_for = metrics_heu["total_scored"]
+            goals_against = metrics_heu["total_conceded"]
+            total_eps = metrics_heu["total_episodes"]
+            wins = metrics_heu["wins"]
 
-            if guardrail_failures:
-                reason_str = " | ".join(guardrail_failures)
-                print(f"   ❌ FAILED SANITY CHECK [{reason_str}]. Skipping champion trial.")
-                continue
+            print(
+                f"   ⚔️  Record : {wins}/{total_eps} Wins ({wr_heu:5.1f}%) | Scored In: {scored_matches}/{total_eps} matches\n"
+                f"   ⚽ Goals  : {goals_for} Scored, {goals_against} Conceded ({net_heu:+d} net) | Reward: {reward_heu:6.3f}"
+            )
 
-            # Pass 2: Champion Trial
-            if double_eval and eval_opp_model is not None:
-                print(f"   ⚔️ [DOUBLE EVAL] Passed sanity check! Challenging Champion {team_size}v{team_size}...")
-                metrics_champ = evaluate_team(
-                    model=model,
-                    device=device,
-                    baseline_type="model",
-                    baseline_model=eval_opp_model,
-                    team_size=team_size,
-                    num_episodes=eval_episodes,
+            # ==========================================
+            # PATH A: Traditional Single Evaluation (Heuristic Only)
+            # ==========================================
+            if not double_eval:
+                # Python tuples evaluate lexicographically in strict order:
+                # 1. Win Rate -> 2. Scored Matches -> 3. Net Goals -> 4. Mean Reward
+                current_score = (
+                    metrics_heu["win_rate"],
+                    scored_matches,
+                    net_heu,
+                    reward_heu,
                 )
 
-                wr = metrics_champ["win_rate"]
-                lr = metrics_champ["loss_rate"]
-                net = metrics_champ["net_goals"]
-                win_loss_spread = (wr - lr) * 100.0
+                if current_score > best_heuristic_score:
+                    prev_score = best_heuristic_score
+                    best_heuristic_score = current_score
 
-                print(f"   ⚔️ Results: Win: {wr*100:.1f}% | Loss: {lr*100:.1f}% | Spread: {win_loss_spread:+.1f}% | Net Goals: {net:+d}")
-
-                # Verify decisive dethroning margin
-                champ_failures = []
-                if net < 10:
-                    champ_failures.append(f"Net Goals: {net:+d} < +10")
-                if (wr - lr) < 0.10:
-                    champ_failures.append(f"Win-Loss Spread: {win_loss_spread:+.1f}% < +10.0%")
-
-                dethroned = (len(champ_failures) == 0)
-
-                if dethroned:
                     save_path = os.path.join(save_dir, "best_model.pt")
                     torch.save(model.state_dict(), save_path)
-                    eval_opp_model.load_state_dict(model.state_dict())
-                    print(f"   ⭐⭐ PROMOTED! Decisively defeated Champion -> Saved: {save_path}")
 
-                    # Event-driven pool expansion
+                    if eval_opp_model is not None:
+                        eval_opp_model.load_state_dict(model.state_dict())
+
                     if pool_dir:
                         history_path = os.path.join(pool_dir, f"history_{global_step}.pt")
                         torch.save(model.state_dict(), history_path)
                         print(f"   📦 POOL UPDATED: Cached new generational champion -> {history_path}")
+
+                    # Format previous metrics safely when initialized to -inf
+                    prev_wr = f"{prev_score[0]*100:.1f}%" if prev_score[0] != -float("inf") else "N/A"
+                    prev_sc = f"{prev_score[1]}" if prev_score[1] != -float("inf") else "N/A"
+                    prev_net = f"{int(prev_score[2]):+d}" if prev_score[2] != -float("inf") else "N/A"
+                    prev_rew = f"{prev_score[3]:.3f}" if prev_score[3] != -float("inf") else "N/A"
+
+                    print(
+                        f"   ⭐⭐ PROMOTED! New Best Score -> Saved: {save_path}\n"
+                        f"      [WR: {metrics_heu['win_rate']*100:.1f}% (was {prev_wr}) | "
+                        f"Scored: {scored_matches} (was {prev_sc}) | "
+                        f"Net: {int(net_heu):+d} (was {prev_net}) | "
+                        f"Rew: {reward_heu:.3f} (was {prev_rew})]"
+                    )
                 else:
-                    reason_str = " | ".join(champ_failures)
-                    print(f"   ❌ RETAINING CHAMPION [{reason_str}].")
+                    best_wr = f"{best_heuristic_score[0]*100:.1f}%" if best_heuristic_score[0] != -float("inf") else "N/A"
+                    best_sc = f"{best_heuristic_score[1]}" if best_heuristic_score[1] != -float("inf") else "N/A"
+                    best_net = f"{int(best_heuristic_score[2]):+d}" if best_heuristic_score[2] != -float("inf") else "N/A"
+                    best_rew = f"{best_heuristic_score[3]:.3f}" if best_heuristic_score[3] != -float("inf") else "N/A"
+
+                    print(
+                        f"   ❌ RETAINING CURRENT BEST. Current score did not beat: "
+                        f"[WR: {best_wr}, Scored: {best_sc}, "
+                        f"Net: {best_net}, Rew: {best_rew}]"
+                    )
+
+            # ==========================================
+            # PATH B: Double Evaluation (Sanity + Champion)
+            # ==========================================
             else:
-                save_path = os.path.join(save_dir, "best_model.pt")
-                torch.save(model.state_dict(), save_path)
-                print(f"   ⭐⭐ PROMOTED! New Best Score -> Saved: {save_path}")
+                # Pass 1: Heuristic Sanity Check Guardrail
+                guardrail_failures = []
+                if metrics_heu["win_rate"] < 0.50:
+                    guardrail_failures.append(f"Win Rate: {wr_heu:.1f}% < 50.0%")
+                if metrics_heu["net_goals"] <= 0:
+                    guardrail_failures.append(f"Net Goals: {metrics_heu['net_goals']:+d} ≤ 0")
+
+                if guardrail_failures:
+                    reason_str = " | ".join(guardrail_failures)
+                    print(f"   ❌ FAILED SANITY CHECK [{reason_str}]. Skipping champion trial.")
+                    continue
+
+                # Pass 2: Champion Trial
+                if eval_opp_model is not None:
+                    print(f"   ⚔️ [DOUBLE EVAL] Passed sanity check! Challenging Champion {team_size}v{team_size}...")
+                    metrics_champ = evaluate_team(
+                        model=model,
+                        device=device,
+                        baseline_type="model",
+                        baseline_model=eval_opp_model,
+                        team_size=team_size,
+                        num_episodes=eval_episodes,
+                    )
+
+                    wr = metrics_champ["win_rate"]
+                    lr = metrics_champ["loss_rate"]
+                    net = metrics_champ["net_goals"]
+                    win_loss_spread = (wr - lr) * 100.0
+
+                    print(f"   ⚔️ Results: Win: {wr*100:.1f}% | Loss: {lr*100:.1f}% | Spread: {win_loss_spread:+.1f}% | Net Goals: {net:+d}")
+
+                    champ_failures = []
+                    if net < 10:
+                        champ_failures.append(f"Net Goals: {net:+d} < +10")
+                    if (wr - lr) < 0.10:
+                        champ_failures.append(f"Win-Loss Spread: {win_loss_spread:+.1f}% < +10.0%")
+
+                    dethroned = (len(champ_failures) == 0)
+
+                    if dethroned:
+                        save_path = os.path.join(save_dir, "best_model.pt")
+                        torch.save(model.state_dict(), save_path)
+                        eval_opp_model.load_state_dict(model.state_dict())
+                        print(f"   ⭐⭐ PROMOTED! Decisively defeated Champion -> Saved: {save_path}")
+
+                        if pool_dir:
+                            history_path = os.path.join(pool_dir, f"history_{global_step}.pt")
+                            torch.save(model.state_dict(), history_path)
+                            print(f"   📦 POOL UPDATED: Cached new generational champion -> {history_path}")
+                    else:
+                        reason_str = " | ".join(champ_failures)
+                        print(f"   ❌ RETAINING CHAMPION [{reason_str}].")
 
     torch.save(model.state_dict(), os.path.join(save_dir, "final_model.pt"))
     print(f"🏁 Training Complete! Saved final model to {save_dir}/final_model.pt")

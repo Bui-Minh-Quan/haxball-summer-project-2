@@ -301,11 +301,12 @@ class DenseReward_3(BaseRewardShaper):
 
 class DenseReward_4(BaseRewardShaper):
     """Team-Based MARL Reward:
-    - Territory: Advantage delta based on (Distance to Own Goal - Distance to Opp Goal).
-    - Score State: Escalating penalty for tied games or trailing teams.
-    - Spacing: Minor penalty if teammates cluster too closely.
-    - Shared Goals: +/- 100 applied uniformly to the whole team.
+    - Territory: Scaled advantage delta toward the opponent's goal.
+    - Escalating Urgency: Quadratic penalty for tied/trailing states as the clock expires.
+    - Zero Stalling: Leading receives 0 per-step reward to avoid clock-bleeding exploits.
+    - Shared Goals: +/- 100 applied uniformly to the team.
     """
+
     def __init__(self, team: str = "red"):
         self.team = team
         self.prev_terr_adv = 0.0
@@ -313,50 +314,48 @@ class DenseReward_4(BaseRewardShaper):
     def _get_territory_advantage(self, sim: Simulation) -> float:
         p = sim.pitch
         ball_pos = sim.ball.pos
-        
-        # Distance to goals
-        d_red = math.hypot(ball_pos.x - p.left, ball_pos.y - p.center_y)
-        d_blue = math.hypot(ball_pos.x - p.right, ball_pos.y - p.center_y)
-        
-        adv = (d_red - d_blue) if self.team == "red" else (d_blue - d_red)
-        return adv
+        goal_y = (p.goal_top + p.goal_bottom) / 2.0 if hasattr(p, "goal_top") else sim.center.y
+
+        d_red = math.hypot(ball_pos.x - p.left, ball_pos.y - goal_y)
+        d_blue = math.hypot(ball_pos.x - p.right, ball_pos.y - goal_y)
+
+        return (d_red - d_blue) if self.team == "red" else (d_blue - d_red)
 
     def reset(self, sim: Simulation):
         self.prev_terr_adv = self._get_territory_advantage(sim)
 
     def compute_reward(self, sim: Simulation, goal_event: str | None, truncated: bool) -> tuple[float, bool, dict]:
         reward = 0.0
-        
-        # 1. Zero-Sum Territory Advantage Delta
+
+        # 1. Territory Advantage Delta (Weight raised to 0.08 for clear touch feedback)
         curr_terr_adv = self._get_territory_advantage(sim)
         delta_adv = curr_terr_adv - self.prev_terr_adv
-        reward += delta_adv * 0.04
+        reward += delta_adv * 0.08
         self.prev_terr_adv = curr_terr_adv
 
-        # 2. Score State Penalty (Urgency mechanic)
+        # 2. Time-Scaled Urgency Penalty
         score_us = sim.score_red if self.team == "red" else sim.score_blue
         score_them = sim.score_blue if self.team == "red" else sim.score_red
-        
-        if score_us <= score_them:
-            # Punish ties and trailing. Penalty scales gently with time.
-            reward -= 0.01 
+        goal_diff = score_us - score_them
 
-        # 3. Spatial Dispersion (Anti-Clustering)
-        teammates = sim.red_team if self.team == "red" else sim.blue_team
-        cluster_penalty = 0.0
-        for i in range(len(teammates)):
-            for j in range(i + 1, len(teammates)):
-                dist = teammates[i].pos.distance_to(teammates[j].pos)
-                if dist < 60.0:
-                    cluster_penalty -= 0.005
-        reward += cluster_penalty
+        # Time progress ratio u in [0.0, 1.0]
+        time_limit = getattr(sim.mode, "time_limit", 30.0) or 30.0
+        time_elapsed = getattr(sim, "time_elapsed", 0.0)
+        time_ratio = min(1.0, max(0.0, time_elapsed / time_limit))
+        urgency = time_ratio ** 2  # Accelerates in the final 10 seconds
 
-        # 4. Shared Terminal Goals
+        if goal_diff < 0:
+            # Trailing: Heavier penalty scaling with the goal deficit
+            deficit = abs(goal_diff)
+            reward -= (0.015 * deficit) * urgency
+        elif goal_diff == 0:
+            # Tied: Moderate penalty late in the match to force a decider
+            reward -= 0.008 * urgency
+
+        # 3. Terminal Shared Goal Events
         if goal_event == f"{self.team}_goal":
             reward += 100.0
         elif goal_event is not None:
             reward -= 100.0
 
         return reward, False, {"goal_event": goal_event}
-
-

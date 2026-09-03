@@ -1,18 +1,216 @@
-import json
 import os
+import json
 import torch
 import torch.nn as nn
 
 from config.match_config import MatchConfig, PlayerSlot, PlayerStats
 from src.bots.heuristic_bot import TeamHeuristicCoordinator
-from src.engine.controllers import HeuristicBotController
+from src.engine.controllers import Controller, HeuristicBotController
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
 from src.rl.benchmarker import RLController
-from src.rl.env_wrapper import RandomController
+from src.rl.env_wrapper import RandomController, MultiAgentRLController
 from src.rl.ppo_core import ActorCritic
 from src.rl.reset_strategies import RandomReset
+
+
+def _resolve_agent_controller(
+    agent: str | nn.Module | Controller,
+    team: str,
+    device: torch.device,
+) -> tuple[Controller, str]:
+    """Resolves arbitrary agent specifications into an active Controller instance."""
+    if isinstance(agent, str):
+        if agent.lower() == "heuristic":
+            coord = TeamHeuristicCoordinator(team=team)
+            return HeuristicBotController(coord), f"Heuristic_{team.capitalize()}"
+        elif agent.lower() == "random":
+            return RandomController(), f"Random_{team.capitalize()}"
+        elif os.path.exists(agent) or agent.endswith(".pt"):
+            model = ActorCritic(obs_dim=80).to(device)
+            ckpt = torch.load(agent, map_location=device, weights_only=False)
+            state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+            model.load_state_dict(state_dict)
+            model.eval()
+            label = os.path.splitext(os.path.basename(agent))[0]
+            # Replace RLController with MultiAgentRLController
+            return MultiAgentRLController(model, team=team, device=device, deterministic=True), label
+        else:
+            raise ValueError(f"Unrecognized agent path or preset string: '{agent}'")
+    elif isinstance(agent, nn.Module):
+        agent.eval()
+        # Replace RLController with MultiAgentRLController
+        return MultiAgentRLController(agent, team=team, device=device, deterministic=True), f"RL_{team.capitalize()}"
+    elif isinstance(agent, Controller):
+        return agent, agent.__class__.__name__
+    else:
+        raise TypeError(f"Unsupported agent type: {type(agent)}")
+
+
+def evaluate_and_generate_html_2(
+    red_agent: str | nn.Module | Controller,
+    blue_agent: str | nn.Module | Controller = "heuristic",
+    team_size: int = 2,
+    red_team_size: int | None = None,
+    blue_team_size: int | None = None,
+    output_dir: str = "render/",
+    filename: str = "match_replay.html",
+    num_episodes: int = 3,
+    max_steps: int = 1800,
+    time_limit: float = 30.0,
+    base_seed: int = 70000,
+    swap_sides: bool = False,
+    device: torch.device = torch.device("cpu"),
+) -> str:
+    """Simulates matches between any combination of agents (RL, Heuristic, Random)
+
+    across arbitrary team sizes (1v1, 2v2, 3v3) and generates an HTML5 replay.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, filename)
+
+    n_red = red_team_size if red_team_size is not None else team_size
+    n_blue = blue_team_size if blue_team_size is not None else team_size
+
+    reset_strat = RandomReset()
+    episodes_data = []
+    pitch_data = None
+    dt = 1.0 / 60.0
+
+    for ep_idx in range(num_episodes):
+        # Determine team assignments
+        is_swapped = swap_sides and (ep_idx % 2 == 1)
+        active_red_agent = blue_agent if is_swapped else red_agent
+        active_blue_agent = red_agent if is_swapped else blue_agent
+
+        ctrl_red, label_red = _resolve_agent_controller(active_red_agent, team="red", device=device)
+        ctrl_blue, label_blue = _resolve_agent_controller(active_blue_agent, team="blue", device=device)
+
+        # Build dynamic multi-agent roster
+        roster = []
+        for i in range(n_red):
+            roster.append(
+                PlayerSlot(
+                    "red",
+                    PlayerStats(name=f"{label_red}_{i + 1}", accel=3200.0),
+                    ctrl_red,
+                )
+            )
+        for i in range(n_blue):
+            roster.append(
+                PlayerSlot(
+                    "blue",
+                    PlayerStats(name=f"{label_blue}_{i + 1}", accel=3200.0),
+                    ctrl_blue,
+                )
+            )
+
+        cfg = MatchConfig(
+            mode=ClassicMatchMode(time_limit=time_limit, score_limit=99),
+            roster=roster,
+            time_limit=time_limit,
+            score_limit=99,
+        )
+
+        pw = getattr(cfg, "pitch_width", 840.0)
+        ph = getattr(cfg, "pitch_height", 480.0)
+        sim = Simulation(match_config=cfg, center_x=pw / 2.0, center_y=ph / 2.0)
+
+        seed = base_seed + ep_idx
+        reset_strat.set_seed(seed)
+        reset_strat.reset(sim)
+
+        # Cache geometry avoiding center_y pitch attribute issues
+        if pitch_data is None:
+            p = sim.pitch
+            center_y = getattr(sim, "center", Vec2(pw / 2.0, ph / 2.0)).y
+            goal_top = getattr(p, "goal_top", center_y - 80.0)
+            goal_bottom = getattr(p, "goal_bottom", center_y + 80.0)
+
+            pitch_data = {
+                "width": p.width,
+                "height": p.height,
+                "left": p.left,
+                "right": p.right,
+                "top": p.top,
+                "bottom": p.bottom,
+                "goal_depth": getattr(p, "goal_depth", 60.0),
+                "goal_top": goal_top,
+                "goal_bottom": goal_bottom,
+            }
+
+        frames = []
+        score_red = 0
+        score_blue = 0
+
+        for step in range(max_steps):
+            players_state = []
+            for player in sim.all_players:
+                players_state.append(
+                    {
+                        "team": player.team,
+                        "name": player.stats.name,
+                        "x": round(float(player.pos.x), 2),
+                        "y": round(float(player.pos.y), 2),
+                        "vx": round(float(player.vel.x), 2),
+                        "vy": round(float(player.vel.y), 2),
+                        "r": float(player.radius),
+                        "is_kicking": bool(player.is_kicking),
+                    }
+                )
+
+            ball_state = {
+                "x": round(float(sim.ball.pos.x), 2),
+                "y": round(float(sim.ball.pos.y), 2),
+                "vx": round(float(sim.ball.vel.x), 2),
+                "vy": round(float(sim.ball.vel.y), 2),
+                "r": float(sim.ball.radius),
+            }
+
+            goal_event = sim.step(dt)
+
+            if goal_event == "red_goal":
+                score_red += 1
+            elif goal_event == "blue_goal":
+                score_blue += 1
+
+            frames.append(
+                {
+                    "step": step,
+                    "time": round(step * dt, 2),
+                    "ball": ball_state,
+                    "players": players_state,
+                    "score_red": score_red,
+                    "score_blue": score_blue,
+                    "goal_event": goal_event,
+                }
+            )
+
+            if goal_event is not None:
+                reset_strat.reset(sim)
+
+        learner_team = "blue" if is_swapped else "red"
+
+        episodes_data.append(
+            {
+                "episode_idx": ep_idx + 1,
+                "learner_team": learner_team,
+                "red_agent": label_red,
+                "blue_agent": label_blue,
+                "seed": seed,
+                "final_score": f"{score_red} - {score_blue}",
+                "frames": frames,
+            }
+        )
+
+    from src.rl.evaluator import _build_html_template
+    html_content = _build_html_template(pitch_data, episodes_data)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"🎬 Multi-Agent Replay generated: {os.path.abspath(out_path)}")
+    return out_path
 
 
 def evaluate_and_generate_html(
@@ -346,16 +544,16 @@ def _build_html_template(pitch_data: dict, episodes_data: list) -> str:
       <strong id="telScore" style="color: #f59e0b; font-size: 16px;">0 - 0</strong>
     </div>
     <div class="telemetry-item">
-      <span>Learner Team</span>
-      <strong id="telLearner">-</strong>
+      <span>Matchup</span>
+      <strong id="telMatchup">-</strong>
     </div>
     <div class="telemetry-item">
       <span>Ball Velocity</span>
       <strong id="telBallVel">0.0 px/s</strong>
     </div>
     <div class="telemetry-item">
-      <span>Learner Kick State</span>
-      <strong id="telKickState">OFF</strong>
+      <span>Active Kicking</span>
+      <strong id="telKickState">None</strong>
     </div>
   </div>
 </div>
@@ -384,15 +582,17 @@ const timeDisplay = document.getElementById("timeDisplay");
 const frameDisplay = document.getElementById("frameDisplay");
 
 const telScore = document.getElementById("telScore");
-const telLearner = document.getElementById("telLearner");
+const telMatchup = document.getElementById("telMatchup");
 const telBallVel = document.getElementById("telBallVel");
 const telKickState = document.getElementById("telKickState");
 
-// Setup Episode Options
+// Safe episode options generation
 episodes.forEach((ep, idx) => {{
   const opt = document.createElement("option");
   opt.value = idx;
-  opt.textContent = `Ep ${{ep.episode_idx}} (Learner: ${{ep.learner_team.toUpperCase()}} | Result: ${{ep.final_score}})`;
+  const redLabel = ep.red_agent || "Red";
+  const blueLabel = ep.blue_agent || "Blue";
+  opt.textContent = `Ep ${{ep.episode_idx}}: ${{redLabel}} vs ${{blueLabel}} (${{ep.final_score}})`;
   epSelect.appendChild(opt);
 }});
 
@@ -404,10 +604,12 @@ function loadEpisode(idx) {{
   currentEpIdx = idx;
   currentFrameIdx = 0;
   const ep = episodes[currentEpIdx];
-  scrubber.max = ep.frames.length - 1;
+  scrubber.max = Math.max(0, ep.frames.length - 1);
   scrubber.value = 0;
-  telLearner.textContent = ep.learner_team.toUpperCase();
-  telLearner.style.color = ep.learner_team === "red" ? "#ef4444" : "#3b82f6";
+  
+  const redLabel = ep.red_agent || "Red";
+  const blueLabel = ep.blue_agent || "Blue";
+  telMatchup.innerHTML = `<span style="color:#ef4444">${{redLabel}}</span> vs <span style="color:#3b82f6">${{blueLabel}}</span>`;
   renderFrame();
 }}
 
@@ -488,10 +690,10 @@ function animationLoop(timestamp) {{
 
 function renderFrame() {{
   const ep = episodes[currentEpIdx];
+  if (!ep || !ep.frames || ep.frames.length === 0) return;
   const frame = ep.frames[currentFrameIdx];
   if (!frame) return;
 
-  // Update Controls & Telemetry
   timeDisplay.textContent = frame.time.toFixed(2) + "s";
   frameDisplay.textContent = `${{frame.step}} / ${{ep.frames.length - 1}}`;
   telScore.textContent = `${{frame.score_red}} - ${{frame.score_blue}}`;
@@ -499,10 +701,13 @@ function renderFrame() {{
   const ballSpeed = Math.hypot(frame.ball.vx, frame.ball.vy);
   telBallVel.textContent = ballSpeed.toFixed(1) + " px/s";
 
-  const learnerPlayer = frame.players.find(p => p.team === ep.learner_team);
-  if (learnerPlayer) {{
-    telKickState.textContent = learnerPlayer.is_kicking ? "KICKING" : "READY";
-    telKickState.style.color = learnerPlayer.is_kicking ? "#22c55e" : "#94a3b8";
+  const kickingPlayers = frame.players.filter(p => p.is_kicking);
+  if (kickingPlayers.length > 0) {{
+    telKickState.textContent = kickingPlayers.map(p => p.name).join(", ");
+    telKickState.style.color = "#fbbf24";
+  }} else {{
+    telKickState.textContent = "None";
+    telKickState.style.color = "#94a3b8";
   }}
 
   // Coordinate Scale
@@ -514,11 +719,9 @@ function renderFrame() {{
   const toScreenX = (x) => margin + (x - pitch.left) * scale;
   const toScreenY = (y) => margin + (y - pitch.top) * scale;
 
-  // Clear Canvas
   ctx.fillStyle = "#15803d";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Pitch Border & Markings
   ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
   ctx.lineWidth = 3;
 
@@ -529,31 +732,25 @@ function renderFrame() {{
   const centerX = (left + right) / 2;
   const centerY = (top + bottom) / 2;
 
-  // Boundary
   ctx.strokeRect(left, top, right - left, bottom - top);
 
-  // Halfway Line
   ctx.beginPath();
   ctx.moveTo(centerX, top);
   ctx.lineTo(centerX, bottom);
   ctx.stroke();
 
-  // Center Circle
   ctx.beginPath();
   ctx.arc(centerX, centerY, 70 * scale, 0, Math.PI * 2);
   ctx.stroke();
 
-  // Goals
   const goalTop = toScreenY(pitch.goal_top);
   const goalBottom = toScreenY(pitch.goal_bottom);
   const goalWidth = 25 * scale;
 
   ctx.fillStyle = "rgba(255, 255, 255, 0.15)";
-  // Left Goal (Red Defends)
   ctx.fillRect(left - goalWidth, goalTop, goalWidth, goalBottom - goalTop);
   ctx.strokeRect(left - goalWidth, goalTop, goalWidth, goalBottom - goalTop);
 
-  // Right Goal (Blue Defends)
   ctx.fillRect(right, goalTop, goalWidth, goalBottom - goalTop);
   ctx.strokeRect(right, goalTop, goalWidth, goalBottom - goalTop);
 
@@ -563,7 +760,6 @@ function renderFrame() {{
     const py = toScreenY(p.y);
     const pr = p.r * scale;
 
-    // Kick Highlight Ring
     if (p.is_kicking) {{
       ctx.beginPath();
       ctx.arc(px, py, pr + 6, 0, Math.PI * 2);
@@ -572,7 +768,6 @@ function renderFrame() {{
       ctx.stroke();
     }}
 
-    // Player Body
     ctx.beginPath();
     ctx.arc(px, py, pr, 0, Math.PI * 2);
     ctx.fillStyle = p.team === "red" ? "#dc2626" : "#2563eb";
@@ -581,7 +776,6 @@ function renderFrame() {{
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Direction Heading Line
     if (Math.hypot(p.vx, p.vy) > 10) {{
       const headingAngle = Math.atan2(p.vy, p.vx);
       ctx.beginPath();
@@ -598,13 +792,11 @@ function renderFrame() {{
   const by = toScreenY(frame.ball.y);
   const br = frame.ball.r * scale;
 
-  // Ball Shadow
   ctx.beginPath();
   ctx.arc(bx + 2, by + 3, br, 0, Math.PI * 2);
   ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
   ctx.fill();
 
-  // Ball Body
   ctx.beginPath();
   ctx.arc(bx, by, br, 0, Math.PI * 2);
   ctx.fillStyle = "#ffffff";
@@ -613,7 +805,6 @@ function renderFrame() {{
   ctx.lineWidth = 1.5;
   ctx.stroke();
 
-  // Goal Flash Event
   if (frame.goal_event) {{
     ctx.fillStyle = "rgba(251, 191, 36, 0.4)";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -625,7 +816,9 @@ function renderFrame() {{
 }}
 
 // Initialize
-loadEpisode(0);
+if (episodes && episodes.length > 0) {{
+  loadEpisode(0);
+}}
 </script>
 </body>
 </html>
