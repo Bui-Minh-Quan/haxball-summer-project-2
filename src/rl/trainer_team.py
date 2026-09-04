@@ -30,6 +30,24 @@ class EvalActionPlaceholder(Controller):
         return self.action
 
 
+class SeededRandomController(Controller):
+    """Deterministic random controller tied to an episode seed."""
+
+    def __init__(self, seed: int):
+        self.rng = np.random.default_rng(seed)
+        self._ego_dirs = [
+            (0.0, 0.0), (0.0, -1.0), (0.0, 1.0),
+            (-1.0, 0.0), (1.0, 0.0), (-1.0, -1.0),
+            (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+        ]
+
+    def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
+        move_idx = int(self.rng.integers(0, 9))
+        kick = bool(self.rng.integers(0, 2))
+        ego_x, ego_y = self._ego_dirs[move_idx]
+        return Vec2(ego_x, ego_y), kick
+
+
 def evaluate_team(
     model: nn.Module,
     device: torch.device,
@@ -41,7 +59,7 @@ def evaluate_team(
     max_steps: int = 1800,
     base_seed: int = 90000,
 ) -> dict:
-    """Evaluates the team policy without logging gradients."""
+    """Evaluates the team policy deterministically without logging gradients."""
     model.eval()
     if baseline_model is not None:
         baseline_model.eval()
@@ -85,10 +103,15 @@ def evaluate_team(
                 o_ph = EvalActionPlaceholder()
                 opp_placeholders[i].append(o_ph)
                 roster.append(PlayerSlot(opp_team, PlayerStats(f"O{p}", accel=3200.0), o_ph))
-        else:
-            opp_ctrl = HeuristicBotController(TeamHeuristicCoordinator(opp_team)) if baseline_type == "heuristic" else RandomController()
+        elif baseline_type == "heuristic":
+            opp_ctrl = HeuristicBotController(TeamHeuristicCoordinator(opp_team))
             for p in range(team_size):
                 roster.append(PlayerSlot(opp_team, PlayerStats(f"O{p}", accel=3200.0), opp_ctrl))
+        else:
+            # Deterministic Seeded Opponent for fair evaluation across training steps
+            for p in range(team_size):
+                seeded_ctrl = SeededRandomController(seed=seed * 100 + p)
+                roster.append(PlayerSlot(opp_team, PlayerStats(f"O{p}", accel=3200.0), seeded_ctrl))
 
         cfg = MatchConfig(mode=ClassicMatchMode(time_limit=time_limit, score_limit=99), roster=roster)
         sim = Simulation(match_config=cfg)
@@ -126,25 +149,21 @@ def evaluate_team(
             l_squad = sims[i].red_team if learner_teams[i] == "red" else sims[i].blue_team
             o_squad = sims[i].blue_team if learner_teams[i] == "red" else sims[i].red_team
 
-            # Extract Centralized State for this env
             global_state_l = extract_global_state(sims[i], learner_teams[i])
             if is_model_baseline:
                 global_state_o = extract_global_state(sims[i], opp_teams[i])
 
-            # Populate Learner Arrays
             for agent in l_squad:
                 obs_batch_learner[idx_l] = extract_obs(sims[i], agent, learner_teams[i])
-                state_batch_learner[idx_l] = global_state_l  # Duplicated for both agents on team
+                state_batch_learner[idx_l] = global_state_l
                 idx_l += 1
 
-            # Populate Opponent Arrays
             if is_model_baseline:
                 for agent in o_squad:
                     obs_batch_opp[idx_o] = extract_obs(sims[i], agent, opp_teams[i])
                     state_batch_opp[idx_o] = global_state_o
                     idx_o += 1
 
-        # Evaluate Policy (MAPPO pass)
         obs_tensor_l = torch.as_tensor(obs_batch_learner, dtype=torch.float32, device=device)
         state_tensor_l = torch.as_tensor(state_batch_learner, dtype=torch.float32, device=device)
         
@@ -158,7 +177,6 @@ def evaluate_team(
                 actions_o, _, _, _ = baseline_model.get_action_and_value(obs_tensor_o, state=state_tensor_o, deterministic=True)
                 actions_np_o = actions_o.cpu().numpy().reshape(total_episodes, team_size, 2)
 
-        # Apply Actions & Step Physics
         for i in range(total_episodes):
             for p in range(team_size):
                 m_idx_l = int(actions_np_l[i, p, 0])
@@ -212,86 +230,51 @@ def train_team_ppo(
     team_size: int = 2,
     **kwargs,
 ):
-    """Centralized Training with Decentralized Execution (MAPPO) Loop with Two-Speed
+    """Production MAPPO Training Loop with Unified Gradient Clipping,
 
-    Optimization, Critic Warm-Up, and KL Regularization.
-
-    Configurable kwargs:
-        - warmup_steps (int): Steps to freeze Actor and calibrate Critic (default: 1_500_000).
-        - lr_actor_initial (float): Initial learning rate for Actor fine-tuning (default: 5e-6).
-        - lr_actor_final (float): Final annealed learning rate for Actor (default: 1e-6).
-        - lr_critic_initial (float): Fast initial learning rate for fresh Critic (default: 3e-4).
-        - lr_critic_final (float): Final annealed learning rate for Critic (default: 1e-5).
-        - ppo_epochs_warmup (int): PPO epochs per batch during Critic warm-up (default: 2).
-        - ppo_epochs_post (int): PPO epochs per batch during fine-tuning (default: 1).
-        - minibatch_size (int): Minibatch chunk size (default: 256).
-        - kl_coef (float): Weight of KL divergence penalty pulling toward reference model (default: 0.05).
-        - actor_clip (float): Gradient clipping norm for Actor layers (default: 0.2).
-        - critic_clip (float): Gradient clipping norm for Critic layers (default: 1.0).
-        - pretrained_model_path (str | None): Path to Stage 3 champion weights for KL anchor.
-        - total_timesteps (int): Total training steps (default: 15_000_000).
-        - num_envs (int): Number of parallel environments (default: 16).
-        - num_steps (int): Rollout steps per environment before update (default: 256).
-        - eval_freq (int): Step interval between evaluations (default: 100_000).
-        - eval_episodes (int): Matches per evaluation run (default: 50).
-        - baseline_type (str): Opponent type for evaluation ("heuristic" or "random").
-        - double_eval (bool): Whether to run secondary champion challenge (default: False).
-        - save_dir (str): Checkpoint output directory (default: "models/stage4").
-        - pool_dir (str | None): Live self-play pool directory (default: None).
+    KL Annealing, and Post-Warmup Baseline Reset.
     """
     # ── 1. Kwargs Resolution ──
-    warmup_steps = kwargs.get("warmup_steps", 1_500_000)
+    warmup_steps = kwargs.get("warmup_steps", 1_000_000)
     total_timesteps = kwargs.get("total_timesteps", 15_000_000)
     num_envs = kwargs.get("num_envs", 16)
     num_steps = kwargs.get("num_steps", 256)
     minibatch_size = kwargs.get("minibatch_size", 256)
     ppo_epochs_warmup = kwargs.get("ppo_epochs_warmup", 2)
-    ppo_epochs_post = kwargs.get("ppo_epochs_post", 1)
+    ppo_epochs_post = kwargs.get("ppo_epochs_post", 1)  # 1 epoch protects fine-tuning
 
-    # Learning Rates & Regularization
-    lr_actor_init = kwargs.get("lr_actor_initial", 5e-6)
-    lr_actor_final = kwargs.get("lr_actor_final", 1e-6)
+    # Learning Rates & Guardrails
+    lr_actor_init = kwargs.get("lr_actor_initial", 1.5e-5)
+    lr_actor_final = kwargs.get("lr_actor_final", 3e-6)
     lr_critic_init = kwargs.get("lr_critic_initial", 3e-4)
     lr_critic_final = kwargs.get("lr_critic_final", 1e-5)
-    kl_coef = kwargs.get("kl_coef", 0.05)
-    actor_clip = kwargs.get("actor_clip", 0.2)
+    
+    kl_coef_init = kwargs.get("kl_coef", 0.02)
+    actor_clip = kwargs.get("actor_clip", 0.5)
     critic_clip = kwargs.get("critic_clip", 1.0)
 
-    # Standard PPO Parameters
+    # Balanced PPO Parameters
     gamma = kwargs.get("gamma", 0.99)
     gae_lambda = kwargs.get("gae_lambda", 0.95)
     clip_range = kwargs.get("clip_range", 0.2)
-    ent_coef_init = kwargs.get("ent_coef_initial", 0.0005)
-    ent_coef_final = kwargs.get("ent_coef_final", 0.0001)
+    ent_coef_init = kwargs.get("ent_coef_initial", 0.003)   # Prevents action distribution collapse
+    ent_coef_final = kwargs.get("ent_coef_final", 0.0008)
 
     # Checkpoint & Eval Config
     eval_freq = kwargs.get("eval_freq", 100_000)
     eval_episodes = kwargs.get("eval_episodes", 50)
-    baseline_type = kwargs.get("baseline_type", "heuristic")
+    baseline_type = kwargs.get("baseline_type", "random")
     double_eval = kwargs.get("double_eval", False)
     pretrained_model_path = kwargs.get("pretrained_model_path", None)
     save_dir = kwargs.get("save_dir", "models/stage4")
     pool_dir = kwargs.get("pool_dir", None)
 
-    # ── 2. Storage & Directory Setup ──
+    # ── 2. Directory Setup ──
     os.makedirs(save_dir, exist_ok=True)
     if pool_dir:
         os.makedirs(pool_dir, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(pool_dir, "latest.pt"))
 
-    # Optional Double-Eval Opponent Model
-    eval_opp_model = None
-    if double_eval:
-        eval_opp_model = ActorCritic(obs_dim=80, state_dim=32).to(device)
-        if pretrained_model_path and os.path.exists(pretrained_model_path):
-            eval_opp_model.load_state_dict(
-                torch.load(pretrained_model_path, map_location=device, weights_only=False)
-            )
-        else:
-            eval_opp_model.load_state_dict(model.state_dict())
-        eval_opp_model.eval()
-
-    # ── 3. Reference Model for KL Policy Anchoring ──
+    # Optional Reference Model for Initial KL Anchoring
     ref_model = None
     if pretrained_model_path and os.path.exists(pretrained_model_path):
         ref_model = ActorCritic(obs_dim=80, state_dim=32).to(device)
@@ -300,9 +283,9 @@ def train_team_ppo(
         actor_state = {k: v for k, v in state_dict.items() if not k.startswith("critic")}
         ref_model.load_state_dict(actor_state, strict=False)
         ref_model.eval()
-        print(f"⚓ KL Anchor Active: Policy regularized against Stage 3 champion: {pretrained_model_path}")
+        print(f"⚓ KL Anchor Active: Policy initially regularized against: {pretrained_model_path}")
 
-    # ── 4. Two-Speed Optimizer Setup ──
+    # ── 3. Two-Speed Optimizer ──
     optimizer = optim.Adam([
         {"params": model.actor_encoder.parameters(), "lr": lr_actor_init, "name": "actor"},
         {"params": model.actor_move.parameters(), "lr": lr_actor_init, "name": "actor"},
@@ -310,7 +293,14 @@ def train_team_ppo(
         {"params": model.critic.parameters(), "lr": lr_critic_init, "name": "critic"},
     ], eps=1e-5)
 
-    # ── 5. Buffer Allocation ──
+    # Collect all Actor parameters into one unified list for correct norm clipping
+    actor_parameters = (
+        list(model.actor_encoder.parameters())
+        + list(model.actor_move.parameters())
+        + list(model.actor_kick.parameters())
+    )
+
+    # ── 4. Buffer Allocations ──
     n_agents = num_envs * team_size
     batch_size = num_steps * n_agents
     state_dim = getattr(model, "state_dim", 32)
@@ -339,19 +329,21 @@ def train_team_ppo(
         f"🚀 MAPPO Training | Format: {team_size}v{team_size} | Envs: {num_envs} | Batch: {batch_size}\n"
         f"⚡ Two-Speed Optimizer: Actor LR = {lr_actor_init:.1e} -> {lr_actor_final:.1e} | "
         f"Critic LR = {lr_critic_init:.1e} -> {lr_critic_final:.1e}\n"
-        f"🛡️  Warm-up: {warmup_steps:,} steps | KL Penalty Weight: {kl_coef} | Post-Warmup Epochs: {ppo_epochs_post}"
+        f"🛡️  Warm-up: {warmup_steps:,} steps | KL Initial: {kl_coef_init} (Annealed to 0.0) | Epochs: {ppo_epochs_post}"
     )
 
-    # ── 6. Main Training Loop ──
+    # ── 5. Main Training Loop ──
     while global_step < total_timesteps:
         progress = global_step / max(1, total_timesteps)
         is_warmup = global_step < warmup_steps
 
+        # Transition notification & Baseline Reset
         if not is_warmup and not warmup_finished_alert and warmup_steps > 0:
-            print(f"\n🔥 [Step {global_step:,}] Critic Warm-Up complete! Unfreezing Actor for fine-tuning updates.")
+            print(f"\n🔥 [Step {global_step:,}] Warm-Up complete! Unfreezing Actor & Resetting Evaluation Baseline.")
             warmup_finished_alert = True
+            best_score = (-float("inf"), -float("inf"), -float("inf"), -float("inf"))
 
-        # Anneal Learning Rates across groups
+        # Anneal Learning Rates
         for param_group in optimizer.param_groups:
             if param_group.get("name") == "actor":
                 param_group["lr"] = lr_actor_init + progress * (lr_actor_final - lr_actor_init)
@@ -359,6 +351,13 @@ def train_team_ppo(
                 param_group["lr"] = lr_critic_init + progress * (lr_critic_final - lr_critic_init)
 
         current_ent = ent_coef_init + progress * (ent_coef_final - ent_coef_init)
+        
+        # Anneal KL coefficient toward 0 once warm-up finishes so agents can learn 2v2 roles
+        if is_warmup:
+            current_kl_coef = kl_coef_init
+        else:
+            post_progress = (global_step - warmup_steps) / max(1, total_timesteps - warmup_steps)
+            current_kl_coef = max(0.0, kl_coef_init * (1.0 - post_progress * 1.5))
 
         # ── Rollout Collection ──
         for step in range(num_steps):
@@ -387,7 +386,7 @@ def train_team_ppo(
             next_state = torch.as_tensor(np.repeat(next_state_np, team_size, axis=0), dtype=torch.float32, device=device)
             next_done = torch.as_tensor(next_done_np.repeat(team_size), dtype=torch.float32, device=device)
 
-        # ── Generalized Advantage Estimation (GAE) ──
+        # ── GAE Estimation ──
         with torch.no_grad():
             _, _, _, next_value = model.get_action_and_value(next_obs, state=next_state)
             advantages = torch.zeros_like(rewards, device=device)
@@ -445,9 +444,9 @@ def train_team_ppo(
                         -mb_advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range),
                     ).mean()
 
-                    # KL Divergence Penalty vs Frozen Stage 3 Reference
+                    # Annealed KL Penalty against 1v1 policy
                     kl_penalty = 0.0
-                    if ref_model is not None and kl_coef > 0:
+                    if ref_model is not None and current_kl_coef > 0.0:
                         with torch.no_grad():
                             ref_feat = ref_model.actor_encoder(b_obs[mb_inds])
                             ref_dist_m = Categorical(logits=ref_model.actor_move(ref_feat))
@@ -455,7 +454,7 @@ def train_team_ppo(
 
                         kl_m = kl_divergence(ref_dist_m, dist_m).mean()
                         kl_k = kl_divergence(ref_dist_k, dist_k).mean()
-                        kl_penalty = kl_coef * (kl_m + kl_k)
+                        kl_penalty = current_kl_coef * (kl_m + kl_k)
 
                     effective_ent = max(current_ent, ent_coef_final)
                     loss = pg_loss + kl_penalty - effective_ent * entropy.mean() + v_loss
@@ -463,16 +462,15 @@ def train_team_ppo(
                 optimizer.zero_grad()
                 loss.backward()
 
-                # Decoupled Gradient Clipping
+                # Correct Unified Gradient Clipping
                 if not is_warmup:
-                    nn.utils.clip_grad_norm_(model.actor_encoder.parameters(), actor_clip)
-                    nn.utils.clip_grad_norm_(model.actor_move.parameters(), actor_clip)
-                    nn.utils.clip_grad_norm_(model.actor_kick.parameters(), actor_clip)
+                    nn.utils.clip_grad_norm_(actor_parameters, actor_clip)
 
                 nn.utils.clip_grad_norm_(model.critic.parameters(), critic_clip)
                 optimizer.step()
 
-        if pool_dir:
+        # Save live latest model strictly after warm-up
+        if not is_warmup and pool_dir:
             torch.save(model.state_dict(), os.path.join(pool_dir, "latest.pt"))
 
         # ── Evaluation & Promotion ──
@@ -501,7 +499,8 @@ def train_team_ppo(
                 f"   ⚽ Goals  : {metrics['total_scored']} Scored, {metrics['total_conceded']} Conceded ({net:+d} net) | Reward: {mean_rew:6.3f}"
             )
 
-            if not double_eval:
+            # Promotion is disabled during warm-up to protect baseline integrity
+            if not is_warmup and not double_eval:
                 current_score = (metrics["win_rate"], scored_matches, net, mean_rew)
 
                 if current_score > best_score:

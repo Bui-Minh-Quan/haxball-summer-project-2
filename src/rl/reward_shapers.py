@@ -302,82 +302,65 @@ class DenseReward_3(BaseRewardShaper):
 
 
 class DenseReward_4(BaseRewardShaper):
-    """Streamlined 2v2 MARL Reward:
-    1. Goals: +100.0 for scoring, -50.0 for conceding (asymmetric stakes).
-    2. Clearance Delta: Potential difference measuring progress away from own net.
-    3. Anti-Clustering: Ball-gated penalty applied only when teammates dogpile simultaneously.
-    4. Whistle Resolution: End-of-match terminal penalty for losses and draws.
-    """
+    """Exploit-free, asymmetric 2v2 reward without artificial crowding penalties."""
 
     def __init__(
         self,
         team: str = "red",
         goal_reward: float = 100.0,
         concede_penalty: float = 100.0,
-        clearance_weight: float = 0.05,
-        crowd_penalty: float = 0.01,
-        crowd_dist_threshold: float = 80.0,
-        ball_dist_threshold: float = 100.0,
+        territory_weight: float = 0.04,
+        first_touch_bonus: float = 5.0,
     ):
         self.team = team
         self.goal_reward = goal_reward
         self.concede_penalty = concede_penalty
-        self.clearance_weight = clearance_weight
-        self.crowd_penalty = crowd_penalty
-        self.crowd_dist_threshold = crowd_dist_threshold
-        self.ball_dist_threshold = ball_dist_threshold
-        self.prev_goal_dist = 0.0
+        self.territory_weight = territory_weight
+        self.first_touch_bonus = first_touch_bonus
 
-    def _get_defending_goal_dist(self, sim: Simulation) -> float:
-        p = sim.pitch
-        goal_y = (p.goal_top + p.goal_bottom) / 2.0 if hasattr(p, "goal_top") else sim.center.y
-        goal_x = p.left if self.team == "red" else p.right
-        return math.hypot(sim.ball.pos.x - goal_x, sim.ball.pos.y - goal_y)
+        self.prev_ball_x = 0.0
+        self.first_touch_claimed = False
 
     def reset(self, sim: Simulation):
-        self.prev_goal_dist = self._get_defending_goal_dist(sim)
+        self.prev_ball_x = sim.ball.pos.x
+        self.first_touch_claimed = False
 
     def compute_reward(
         self, sim: Simulation, goal_event: str | None, truncated: bool
     ) -> tuple[float, bool, dict]:
         reward = 0.0
         ball = sim.ball
+        sign = 1.0 if self.team == "red" else -1.0
         my_team = sim.red_team if self.team == "red" else sim.blue_team
+        opp_team = sim.blue_team if self.team == "red" else sim.red_team
 
-        # 1. Clearance Potential Delta (Away from own net is positive)
-        curr_dist = self._get_defending_goal_dist(sim)
-        delta_dist = curr_dist - self.prev_goal_dist
-        reward += delta_dist * self.clearance_weight
-        self.prev_goal_dist = curr_dist
+        # 1. First Touch Kickoff Bounty
+        if not self.first_touch_claimed:
+            for agent in my_team:
+                reach = agent.radius + ball.radius + agent.stats.kick_margin + 4.0
+                if agent.pos.distance_to(ball.pos) <= reach:
+                    reward += self.first_touch_bonus
+                    self.first_touch_claimed = True
+                    break
 
-        # 2. Anti-Clustering (Ball-Gated Crowding Penalty)
-        if len(my_team) >= 2:
-            p1, p2 = my_team[0], my_team[1]
-            dist_players = p1.pos.distance_to(p2.pos)
-            dist_p1_ball = p1.pos.distance_to(ball.pos)
-            dist_p2_ball = p2.pos.distance_to(ball.pos)
+            if not self.first_touch_claimed:
+                for opp in opp_team:
+                    reach = opp.radius + ball.radius + opp.stats.kick_margin + 4.0
+                    if opp.pos.distance_to(ball.pos) <= reach:
+                        self.first_touch_claimed = True
+                        break
 
-            # Penalize only when players crowd each other while simultaneously swarming the ball
-            if (
-                dist_players < self.crowd_dist_threshold
-                and dist_p1_ball < self.ball_dist_threshold
-                and dist_p2_ball < self.ball_dist_threshold
-            ):
-                reward -= self.crowd_penalty
+        # 2. X-Axis Territory Advancement
+        delta_x = (ball.pos.x - self.prev_ball_x) * sign
+        reward += delta_x * self.territory_weight
 
-        # 3. Match Outcomes & Goals
+        # 3. Match Outcomes
         if goal_event == f"{self.team}_goal":
             reward += self.goal_reward
+            self.first_touch_claimed = False
         elif goal_event is not None:
             reward -= self.concede_penalty
-        elif truncated:
-            score_us = sim.score_red if self.team == "red" else sim.score_blue
-            score_them = sim.score_blue if self.team == "red" else sim.score_red
-            diff = score_us - score_them
+            self.first_touch_claimed = False
 
-            if diff < 0:
-                reward -= 10.0 * abs(diff)
-            elif diff == 0:
-                reward -= 5.0
-
+        self.prev_ball_x = ball.pos.x
         return reward, False, {"goal_event": goal_event}
