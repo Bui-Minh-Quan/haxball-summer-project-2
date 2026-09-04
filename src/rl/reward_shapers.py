@@ -299,63 +299,85 @@ class DenseReward_3(BaseRewardShaper):
     return reward, False, {"goal_event": goal_event}
 
 
+
+
 class DenseReward_4(BaseRewardShaper):
-    """Team-Based MARL Reward:
-    - Territory: Scaled advantage delta toward the opponent's goal.
-    - Escalating Urgency: Quadratic penalty for tied/trailing states as the clock expires.
-    - Zero Stalling: Leading receives 0 per-step reward to avoid clock-bleeding exploits.
-    - Shared Goals: +/- 100 applied uniformly to the team.
+    """Streamlined 2v2 MARL Reward:
+    1. Goals: +100.0 for scoring, -50.0 for conceding (asymmetric stakes).
+    2. Clearance Delta: Potential difference measuring progress away from own net.
+    3. Anti-Clustering: Ball-gated penalty applied only when teammates dogpile simultaneously.
+    4. Whistle Resolution: End-of-match terminal penalty for losses and draws.
     """
 
-    def __init__(self, team: str = "red"):
+    def __init__(
+        self,
+        team: str = "red",
+        goal_reward: float = 100.0,
+        concede_penalty: float = 100.0,
+        clearance_weight: float = 0.05,
+        crowd_penalty: float = 0.01,
+        crowd_dist_threshold: float = 80.0,
+        ball_dist_threshold: float = 100.0,
+    ):
         self.team = team
-        self.prev_terr_adv = 0.0
+        self.goal_reward = goal_reward
+        self.concede_penalty = concede_penalty
+        self.clearance_weight = clearance_weight
+        self.crowd_penalty = crowd_penalty
+        self.crowd_dist_threshold = crowd_dist_threshold
+        self.ball_dist_threshold = ball_dist_threshold
+        self.prev_goal_dist = 0.0
 
-    def _get_territory_advantage(self, sim: Simulation) -> float:
+    def _get_defending_goal_dist(self, sim: Simulation) -> float:
         p = sim.pitch
-        ball_pos = sim.ball.pos
         goal_y = (p.goal_top + p.goal_bottom) / 2.0 if hasattr(p, "goal_top") else sim.center.y
-
-        d_red = math.hypot(ball_pos.x - p.left, ball_pos.y - goal_y)
-        d_blue = math.hypot(ball_pos.x - p.right, ball_pos.y - goal_y)
-
-        return (d_red - d_blue) if self.team == "red" else (d_blue - d_red)
+        goal_x = p.left if self.team == "red" else p.right
+        return math.hypot(sim.ball.pos.x - goal_x, sim.ball.pos.y - goal_y)
 
     def reset(self, sim: Simulation):
-        self.prev_terr_adv = self._get_territory_advantage(sim)
+        self.prev_goal_dist = self._get_defending_goal_dist(sim)
 
-    def compute_reward(self, sim: Simulation, goal_event: str | None, truncated: bool) -> tuple[float, bool, dict]:
+    def compute_reward(
+        self, sim: Simulation, goal_event: str | None, truncated: bool
+    ) -> tuple[float, bool, dict]:
         reward = 0.0
+        ball = sim.ball
+        my_team = sim.red_team if self.team == "red" else sim.blue_team
 
-        # 1. Territory Advantage Delta (Weight raised to 0.08 for clear touch feedback)
-        curr_terr_adv = self._get_territory_advantage(sim)
-        delta_adv = curr_terr_adv - self.prev_terr_adv
-        reward += delta_adv * 0.08
-        self.prev_terr_adv = curr_terr_adv
+        # 1. Clearance Potential Delta (Away from own net is positive)
+        curr_dist = self._get_defending_goal_dist(sim)
+        delta_dist = curr_dist - self.prev_goal_dist
+        reward += delta_dist * self.clearance_weight
+        self.prev_goal_dist = curr_dist
 
-        # 2. Time-Scaled Urgency Penalty
-        score_us = sim.score_red if self.team == "red" else sim.score_blue
-        score_them = sim.score_blue if self.team == "red" else sim.score_red
-        goal_diff = score_us - score_them
+        # 2. Anti-Clustering (Ball-Gated Crowding Penalty)
+        if len(my_team) >= 2:
+            p1, p2 = my_team[0], my_team[1]
+            dist_players = p1.pos.distance_to(p2.pos)
+            dist_p1_ball = p1.pos.distance_to(ball.pos)
+            dist_p2_ball = p2.pos.distance_to(ball.pos)
 
-        # Time progress ratio u in [0.0, 1.0]
-        time_limit = getattr(sim.mode, "time_limit", 30.0) or 30.0
-        time_elapsed = getattr(sim, "time_elapsed", 0.0)
-        time_ratio = min(1.0, max(0.0, time_elapsed / time_limit))
-        urgency = time_ratio ** 2  # Accelerates in the final 10 seconds
+            # Penalize only when players crowd each other while simultaneously swarming the ball
+            if (
+                dist_players < self.crowd_dist_threshold
+                and dist_p1_ball < self.ball_dist_threshold
+                and dist_p2_ball < self.ball_dist_threshold
+            ):
+                reward -= self.crowd_penalty
 
-        if goal_diff < 0:
-            # Trailing: Heavier penalty scaling with the goal deficit
-            deficit = abs(goal_diff)
-            reward -= (0.015 * deficit) * urgency
-        elif goal_diff == 0:
-            # Tied: Moderate penalty late in the match to force a decider
-            reward -= 0.008 * urgency
-
-        # 3. Terminal Shared Goal Events
+        # 3. Match Outcomes & Goals
         if goal_event == f"{self.team}_goal":
-            reward += 100.0
+            reward += self.goal_reward
         elif goal_event is not None:
-            reward -= 100.0
+            reward -= self.concede_penalty
+        elif truncated:
+            score_us = sim.score_red if self.team == "red" else sim.score_blue
+            score_them = sim.score_blue if self.team == "red" else sim.score_red
+            diff = score_us - score_them
+
+            if diff < 0:
+                reward -= 10.0 * abs(diff)
+            elif diff == 0:
+                reward -= 5.0
 
         return reward, False, {"goal_event": goal_event}

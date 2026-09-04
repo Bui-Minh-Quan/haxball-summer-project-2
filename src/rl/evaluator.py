@@ -28,26 +28,29 @@ def _resolve_agent_controller(
         elif agent.lower() == "random":
             return RandomController(), f"Random_{team.capitalize()}"
         elif os.path.exists(agent) or agent.endswith(".pt"):
-            model = ActorCritic(obs_dim=80).to(device)
             ckpt = torch.load(agent, map_location=device, weights_only=False)
             state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+            # Dynamically infer state_dim from checkpoint weights (MAPPO=32, IPPO/1v1=80)
+            state_dim = 80
+            if "critic.0.weight" in state_dict:
+                state_dim = state_dict["critic.0.weight"].shape[1]
+
+            model = ActorCritic(obs_dim=80, state_dim=state_dim).to(device)
             model.load_state_dict(state_dict)
             model.eval()
             label = os.path.splitext(os.path.basename(agent))[0]
-            # Replace RLController with MultiAgentRLController
             return MultiAgentRLController(model, team=team, device=device, deterministic=True), label
         else:
             raise ValueError(f"Unrecognized agent path or preset string: '{agent}'")
     elif isinstance(agent, nn.Module):
         agent.eval()
-        # Replace RLController with MultiAgentRLController
         return MultiAgentRLController(agent, team=team, device=device, deterministic=True), f"RL_{team.capitalize()}"
     elif isinstance(agent, Controller):
         return agent, agent.__class__.__name__
     else:
         raise TypeError(f"Unsupported agent type: {type(agent)}")
-
-
+    
 def evaluate_and_generate_html_2(
     red_agent: str | nn.Module | Controller,
     blue_agent: str | nn.Module | Controller = "heuristic",

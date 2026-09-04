@@ -12,7 +12,8 @@ from src.engine.controllers import Controller, HeuristicBotController
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
 from src.bots.heuristic_bot import TeamHeuristicCoordinator
-from src.rl.obs_extractor import extract_obs
+
+from src.rl.obs_extractor import extract_obs, extract_global_state
 from src.rl.ppo_core import ActorCritic
 from src.rl.reward_shapers import BaseRewardShaper
 from src.rl.reset_strategies import BaseResetStrategy
@@ -58,7 +59,13 @@ class Stage2OpponentController(Controller):
 
 
 class PoolController(Controller):
-    def __init__(self, pool_dir: str, team: str = "blue", device: str = "cpu", heuristic_pct: float = 0.3):
+    def __init__(
+        self,
+        pool_dir: str,
+        team: str = "blue",
+        device: str = "cpu",
+        heuristic_pct: float = 0.3,
+    ):
         torch.set_num_threads(1)
         self.pool_dir = pool_dir
         self.team = team
@@ -99,7 +106,11 @@ class PoolController(Controller):
         if target_file and os.path.exists(target_file):
             try:
                 ckpt = torch.load(target_file, map_location=self.device, weights_only=False)
-                self.rl_model.load_state_dict(ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt)
+                state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+                # Filter out Critic weights so shape variations (80d vs 32d) never block Actor loading
+                actor_state = {k: v for k, v in state_dict.items() if not k.startswith("critic")}
+                self.rl_model.load_state_dict(actor_state, strict=False)
                 self.is_ready = True
             except Exception:
                 self.current_mode = "heuristic"
@@ -111,7 +122,6 @@ class PoolController(Controller):
             return self.heuristic_ctrl.get_action(player_idx, sim)
 
         player = sim.all_players[player_idx]
-        
         obs = extract_obs(sim, player, team=self.team)
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
@@ -121,7 +131,6 @@ class PoolController(Controller):
         act = action.squeeze(0).cpu().numpy()
         m_idx = int(act[0])
         kick = bool(act[1])
-
 
         ego_x, ego_y = self._ego_dirs[m_idx]
         world_move = Vec2(ego_x * self.sign, ego_y)
@@ -187,7 +196,7 @@ class MatchEnv(gym.Env):
             (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
         ]
 
-        # 1. Replace "RL" strings with ActionPlaceholder BEFORE initializing Simulation
+        # 1. Replace "RL" string place markers with controller placeholders
         self.learner_slots = []
         for i, slot in enumerate(match_config.roster):
             if slot.team == learner_team and slot.controller == "RL":
@@ -196,40 +205,58 @@ class MatchEnv(gym.Env):
 
         self.num_learners = len(self.learner_slots)
 
-        # 2. Initialize Simulation with valid controller instances
+        # 2. Simulation initialization
         pw = getattr(match_config, "pitch_width", 840.0)
         ph = getattr(match_config, "pitch_height", 480.0)
         self.sim = Simulation(match_config=match_config, center_x=pw / 2.0, center_y=ph / 2.0)
 
-        # 3. Ensure player instances inside sim reference the placeholders directly
+        # 3. Bind player instances to placeholders
         team_roster = [s for s in match_config.roster if s.team == self.learner_team]
         for roster_idx, slot in self.learner_slots:
             player_idx_in_team = team_roster.index(slot)
-            agent = self.sim.red_team[player_idx_in_team] if self.learner_team == "red" else self.sim.blue_team[player_idx_in_team]
+            agent = (
+                self.sim.red_team[player_idx_in_team]
+                if self.learner_team == "red"
+                else self.sim.blue_team[player_idx_in_team]
+            )
             if hasattr(agent, "controller"):
                 agent.controller = slot.controller
 
-        # 4. Adjust Gym spaces based on team size
+        # 4. Spaces definition (Tuple for MAPPO, Box for 1v1)
         obs_dim = 80
+        state_dim = 32
+
         if self.num_learners == 1:
             self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
             self.action_space = spaces.MultiDiscrete([9, 2])
         else:
-            self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_learners, obs_dim), dtype=np.float32)
+            obs_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_learners, obs_dim), dtype=np.float32)
+            state_space = spaces.Box(low=-1.0, high=1.0, shape=(state_dim,), dtype=np.float32)
+            self.observation_space = spaces.Tuple((obs_space, state_space))
             self.action_space = spaces.MultiDiscrete([[9, 2]] * self.num_learners)
 
-    def _get_obs(self):
+    def _get_obs_and_state(self):
         obs_list = []
+        team_roster = [s for s in self.match_config.roster if s.team == self.learner_team]
+
         for roster_idx, slot in self.learner_slots:
-            # Player index inside their specific team array
-            team_roster = [s for s in self.match_config.roster if s.team == self.learner_team]
             player_idx_in_team = team_roster.index(slot)
-            agent = self.sim.red_team[player_idx_in_team] if self.learner_team == "red" else self.sim.blue_team[player_idx_in_team]
+            agent = (
+                self.sim.red_team[player_idx_in_team]
+                if self.learner_team == "red"
+                else self.sim.blue_team[player_idx_in_team]
+            )
             obs_list.append(extract_obs(self.sim, agent, self.learner_team))
-            
+
         if self.num_learners == 1:
             return obs_list[0]
-        return np.array(obs_list, dtype=np.float32)
+
+        obs_array = np.array(obs_list, dtype=np.float32)
+        state_array = extract_global_state(self.sim, self.learner_team)
+        return (obs_array, state_array)
+
+    # Alias to prevent AttributeError if called by legacy routines
+    _get_obs = _get_obs_and_state
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -241,15 +268,14 @@ class MatchEnv(gym.Env):
 
         self.reset_strategy.reset(self.sim)
         self.reward_shaper.reset(self.sim)
-        
-        # Use the multi-agent observation extractor
-        return self._get_obs(), {}
+
+        return self._get_obs_and_state(), {}
 
     def step(self, action):
-    # Route actions to the correct learner slots
         if self.num_learners == 1:
             action = [action]
 
+        # Route actions
         for i, (roster_idx, slot) in enumerate(self.learner_slots):
             m_idx = int(action[i][0])
             k_val = bool(action[i][1])
@@ -257,23 +283,29 @@ class MatchEnv(gym.Env):
             sign = 1.0 if self.learner_team == "red" else -1.0
             world_move = Vec2(ego_x * sign, ego_y)
 
-            # Update the placeholder controller
             slot.controller.action = (world_move, k_val)
 
+        # Physics sub-steps
         goal_event = self.sim.step(1.0 / 60.0)
         self.current_step += 1
-
-        obs = self._get_obs()
         truncated = self.current_step >= self.max_steps
 
-        # Shared Team Reward (returns a scalar float)
+        # Compute step reward
         reward, terminated, info = self.reward_shaper.compute_reward(
             self.sim, goal_event, truncated
         )
 
-        if goal_event is not None or truncated:
+        # Reset post-goal before extracting observations
+        if goal_event is not None:
             self.reset_strategy.reset(self.sim)
             self.reward_shaper.reset(self.sim)
 
-        # Strictly return a scalar float for reward
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        obs_payload = self._get_obs_and_state()
+
+        if truncated:
+            self.reset_strategy.reset(self.sim)
+            self.reward_shaper.reset(self.sim)
+
+        return obs_payload, float(reward), bool(terminated), bool(truncated), info
+
+    
