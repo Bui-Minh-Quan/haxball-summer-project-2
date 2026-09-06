@@ -41,12 +41,19 @@ class PauseState(GameState):
         ]
 
     def _resume(self):
+        if pygame.mixer.get_init():
+            pygame.mixer.music.unpause()
+            pygame.mixer.unpause()  # Resumes paused sound effects
         self.context.state_manager.pop_state()
 
     def _to_menu(self):
         from src.game.states.menu_state import MenuState
 
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+            pygame.mixer.stop()  # Discards any paused celebration/kick audio completely
         self.context.state_manager.change_state(MenuState(self.context))
+
 
     def _quit(self):
         self.context.running = False

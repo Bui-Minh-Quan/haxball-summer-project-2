@@ -50,7 +50,7 @@ class MenuState(GameState):
         cx = self.context.screen_width // 2
 
         title_surf = self.font_title.render("HAXBALL AI", True, (255, 255, 255))
-        sub_surf = self.font_sub.render("Tactical Multi-Agent Engine", True, (100, 160, 255))
+        sub_surf = self.font_sub.render("Tactical Agent Engine", True, (100, 160, 255))
 
         surface.blit(title_surf, title_surf.get_rect(center=(cx, 210)))
         surface.blit(sub_surf, sub_surf.get_rect(center=(cx, 265)))

@@ -9,10 +9,10 @@ class PlayerStats:
     name: str = "Player"
     radius: float = 20.0
     mass: float = 2.0
-    accel: float = 3200.0
+    accel: float = 2000.0
     friction: float = 0.94
     restitution: float = 0.75
-    kick_strength: float = 1400.0
+    kick_strength: float = 1200.0
     kick_cooldown: float = 0.10
     kick_margin: float = 6.0
 

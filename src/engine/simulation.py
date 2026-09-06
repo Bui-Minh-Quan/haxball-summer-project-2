@@ -39,6 +39,7 @@ class Simulation:
 
         self.score_red = 0
         self.score_blue = 0
+        self.kicked_this_step = False
 
         self._spawn_roster()
         if self.match_config and self.match_config.mode:
@@ -84,14 +85,16 @@ class Simulation:
             player.vel = Vec2(0.0, 0.0)
 
     def step(self, dt: float) -> str | None:
+        self.kicked_this_step = False
+        real_dt = dt
         if self.match_config:
             dt *= self.match_config.game_speed
 
         mode = self.match_config.mode if self.match_config else None
 
-        # 1. Mode Hook
+        # 1. Mode Hook uses true wall-clock time so timers are game-speed independent
         if mode:
-            mode.on_step(self, dt)
+            mode.on_step(self, real_dt)
 
         # 2. Query Controllers
         for idx, (player, controller) in enumerate(zip(self.all_players, self.controllers)):
@@ -152,6 +155,7 @@ class Simulation:
             normal = to_ball.normalize()
             self.ball.vel = player.vel + (normal * player.stats.kick_strength)
             player.is_kicking = False
+            self.kicked_this_step = True
 
     def _resolve_circle_collision(self, d1: Disc, d2: Disc, restitution: float):
         delta = d2.pos - d1.pos

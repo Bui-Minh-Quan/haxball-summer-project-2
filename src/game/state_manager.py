@@ -9,7 +9,9 @@ class GameContext:
     def __init__(self, screen_width: int, screen_height: int):
         self.screen_width = screen_width
         self.screen_height = screen_height
-        self.screen = pygame.display.set_mode((screen_width, screen_height))
+        self.screen = pygame.display.set_mode(
+            (screen_width, screen_height), pygame.RESIZABLE
+        )
         self.clock = pygame.time.Clock()
         self.state_manager: "StateManager | None" = None
         self.running = True

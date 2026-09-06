@@ -37,13 +37,22 @@ class ClassicMatchMode(GameMode):
         if self.time_limit > 0 and self.state != "GOAL_SCORED":
             self.time_remaining = max(0.0, self.time_remaining - dt)
 
-        # 2. Post-Goal Celebration State (Frozen timer, resets to Kickoff)
+        # Stop match state transitions if game is over
+        if self.is_game_over(sim) and self.state != "GOAL_SCORED":
+            self.state = "GAME_OVER"
+            return None
+
+        # 2. Post-Goal Celebration State
         if self.state == "GOAL_SCORED":
             self.state_timer -= dt
             if self.state_timer <= 0.0:
-                sim.reset_positions()
-                self.state = "KICKOFF"
-                self.kickoff_timer = 0.0
+                # ONLY reset if the match is still ongoing
+                if self.is_game_over(sim):
+                    self.state = "GAME_OVER"  # Freeze state, NO reset_positions()
+                else:
+                    sim.reset_positions()
+                    self.state = "KICKOFF"
+                    self.kickoff_timer = 0.0
                 return None
 
         # 3. Kickoff State
@@ -62,6 +71,7 @@ class ClassicMatchMode(GameMode):
                     sim.reset_positions()
 
         return None
+
 
     def enforce_player_bounds(self, player: Any, sim: Any):
         p = sim.pitch
@@ -147,6 +157,8 @@ class ClassicMatchMode(GameMode):
         p = sim.pitch
         b = sim.ball
         goal_event = None
+        curve_offset = 15.0
+        depth = p.cfg.GOAL_DEPTH
 
         # Top and Bottom Touchlines
         if b.pos.y - b.radius < p.top:
@@ -156,46 +168,61 @@ class ClassicMatchMode(GameMode):
             b.pos.y = p.bottom - b.radius
             b.vel.y *= -b.restitution
 
-        # Left Net & Goal Posts (Red Goal line / Blue scores)
+        # Left Net (Red Goal Mouth / Blue Scores)
         if b.pos.x - b.radius < p.left:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x - b.radius < p.left - p.cfg.GOAL_DEPTH:
-                    b.pos.x = p.left - p.cfg.GOAL_DEPTH + b.radius
+                # Slanted net boundary calculation
+                t = max(0.0, min(1.0, (p.left - b.pos.x) / depth))
+                cur_top = p.goal_top + (curve_offset * t)
+                cur_bot = p.goal_bottom - (curve_offset * t)
+
+                # Back wall collision
+                if b.pos.x - b.radius < p.left - depth:
+                    b.pos.x = p.left - depth + b.radius
                     b.vel.x *= -b.restitution
-                if b.pos.y - b.radius < p.goal_top:
-                    b.pos.y = p.goal_top + b.radius
+                # Slanted top net
+                if b.pos.y - b.radius < cur_top:
+                    b.pos.y = cur_top + b.radius
                     b.vel.y *= -b.restitution
-                elif b.pos.y + b.radius > p.goal_bottom:
-                    b.pos.y = p.goal_bottom - b.radius
+                # Slanted bottom net
+                elif b.pos.y + b.radius > cur_bot:
+                    b.pos.y = cur_bot - b.radius
                     b.vel.y *= -b.restitution
 
-                if self.state != "GOAL_SCORED" and b.pos.x < p.left:
+                if self.state not in ("GOAL_SCORED", "GAME_OVER") and not self.is_game_over(sim) and b.pos.x < p.left:
                     sim.score_blue += 1
                     self.state = "GOAL_SCORED"
-                    self.state_timer = 1.0
+                    self.state_timer = 2.5
                     self.kickoff_team = "red"
                     goal_event = "blue_goal"
             else:
                 b.pos.x = p.left + b.radius
                 b.vel.x *= -b.restitution
 
-        # Right Net & Goal Posts (Blue Goal line / Red scores)
+        # Right Net (Blue Goal Mouth / Red Scores)
         elif b.pos.x + b.radius > p.right:
             if p.goal_top <= b.pos.y <= p.goal_bottom:
-                if b.pos.x + b.radius > p.right + p.cfg.GOAL_DEPTH:
-                    b.pos.x = p.right + p.cfg.GOAL_DEPTH - b.radius
+                t = max(0.0, min(1.0, (b.pos.x - p.right) / depth))
+                cur_top = p.goal_top + (curve_offset * t)
+                cur_bot = p.goal_bottom - (curve_offset * t)
+
+                # Back wall collision
+                if b.pos.x + b.radius > p.right + depth:
+                    b.pos.x = p.right + depth - b.radius
                     b.vel.x *= -b.restitution
-                if b.pos.y - b.radius < p.goal_top:
-                    b.pos.y = p.goal_top + b.radius
+                # Slanted top net
+                if b.pos.y - b.radius < cur_top:
+                    b.pos.y = cur_top + b.radius
                     b.vel.y *= -b.restitution
-                elif b.pos.y + b.radius > p.goal_bottom:
-                    b.pos.y = p.goal_bottom - b.radius
+                # Slanted bottom net
+                elif b.pos.y + b.radius > cur_bot:
+                    b.pos.y = cur_bot - b.radius
                     b.vel.y *= -b.restitution
 
-                if self.state != "GOAL_SCORED" and b.pos.x > p.right:
+                if self.state not in ("GOAL_SCORED", "GAME_OVER") and not self.is_game_over(sim) and b.pos.x > p.right:
                     sim.score_red += 1
                     self.state = "GOAL_SCORED"
-                    self.state_timer = 1.0
+                    self.state_timer = 2.5
                     self.kickoff_team = "blue"
                     goal_event = "red_goal"
             else:

@@ -6,9 +6,16 @@ from src.game.states.menu_state import MenuState
 
 class App:
 
-    def __init__(self, width: int = 1200, height: int = 800):
+    def __init__(self, width: int | None = None, height: int | None = None):
         pygame.init()
         pygame.font.init()
+
+        # Query native monitor resolution if dimensions are not explicitly specified
+        if width is None or height is None:
+            info = pygame.display.Info()
+            width = info.current_w
+            height = info.current_h
+
         self.context = GameContext(screen_width=width, screen_height=height)
         self.manager = StateManager(self.context)
         self.manager.change_state(MenuState(self.context))
