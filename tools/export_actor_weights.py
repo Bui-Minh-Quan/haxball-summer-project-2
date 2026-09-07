@@ -8,8 +8,8 @@ import onnx
 import onnxscript
 
 # Add project root to path
-#ROOT_DIR = Path(__file__).resolve().parent.parent
-#sys.path.insert(0, str(ROOT_DIR))
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 
 from src.rl.ppo_core import ActorCritic
 

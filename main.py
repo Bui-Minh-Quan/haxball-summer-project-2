@@ -1,5 +1,12 @@
+import os
+import sys
+
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    os.chdir(sys._MEIPASS)
+
 import pygame
 from config.physics_config import PhysicsConfig
+
 from src.game.app import App
 
 if __name__ == "__main__":
