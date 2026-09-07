@@ -72,7 +72,6 @@ class ClassicMatchMode(GameMode):
 
         return None
 
-
     def enforce_player_bounds(self, player: Any, sim: Any):
         p = sim.pitch
 
@@ -93,7 +92,7 @@ class ClassicMatchMode(GameMode):
 
         # 2. Kickoff Circle & Half-Pitch Geometric Boundaries
         if self.state == "KICKOFF":
-            R = p.cfg.CENTER_CIRCLE_RADIUS
+            R = p.center_circle_radius
             r = player.radius
             sign = 1.0 if player.team == "red" else -1.0
             is_attacking = player.team == self.kickoff_team

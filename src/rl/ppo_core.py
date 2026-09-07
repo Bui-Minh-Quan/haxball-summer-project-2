@@ -112,7 +112,7 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, value
 
     def load_actor_weights(self, path: str, device: torch.device):
-        """Bootstraps Actor weights from Stage 3 while initializing a fresh Critic."""
+        """Bootstraps Actor weights from Previous Stage while initializing a fresh Critic."""
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
 

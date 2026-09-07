@@ -1,14 +1,18 @@
 import os
+from pathlib import Path
 import pygame
 from config.match_config import MatchConfig, PlayerSlot, PlayerStats
 from src.bots.heuristic_bot import TeamHeuristicCoordinator
-from src.engine.controllers import HeuristicBotController
+from src.engine.controllers import HeuristicBotController, NumpyRLController
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.game.controllers import KeyboardController
 from src.game.state_manager import GameState
 from src.game.states.play_state import PlayState
 from src.game.ui.button import Button
+from src.rl.numpy_actor import NumpyActor
 
+
+_LOADED_ACTORS: dict[str, NumpyActor] = {}
 
 class Dropup:
     def __init__(
@@ -275,42 +279,42 @@ class QuickPlayConfigState(GameState):
             hover_color=(70, 78, 98),
         )
 
+    def _get_or_load_actor(self, npz_path: str) -> NumpyActor | None:
+        """Loads NumpyActor into RAM and caches it for subsequent matches."""
+        if npz_path in _LOADED_ACTORS:
+            return _LOADED_ACTORS[npz_path]
+
+        if os.path.exists(npz_path):
+            try:
+                actor = NumpyActor(npz_path)
+                _LOADED_ACTORS[npz_path] = actor
+                return actor
+            except Exception as e:
+                print(f"[Warning] Failed to load model from {npz_path}: {e}")
+        return None
+
     def _resolve_opponent_controller(self, opp_type: str, opp_team: str):
+        """Resolves opponent controller using pure NumPy inference without PyTorch."""
         if opp_type == "heuristic":
             coord = TeamHeuristicCoordinator(team=opp_team)
             return HeuristicBotController(coord), "Heuristic Bot"
 
-        ckpt_path = (
-            "models/stage2/best_model.pt"
-            if opp_type == "rl_stage2"
-            else "models/stage3/best_model.pt"
+        # Map UI choice to the exported .npz model
+        model_filename = (
+            "stage2_actor.npz" if opp_type == "rl_stage2" else "stage3_actor.npz"
         )
         display_label = (
-            "Easy RL (Stage 2)" if opp_type == "rl_stage2" else "Medium RL (Stage 3)"
+            "Easy RL" if opp_type == "rl_stage2" else "Medium RL"
         )
+        npz_path = os.path.join("assets", "models", model_filename)
 
-        if os.path.exists(ckpt_path):
-            try:
-                import torch
-                from src.rl.ppo_core import ActorCritic
-                from src.rl.benchmarker import RLController
+        actor = self._get_or_load_actor(npz_path)
+        if actor is not None:
+            controller = NumpyRLController(actor, team=opp_team)
+            return controller, display_label
 
-                model = ActorCritic(obs_dim=80, state_dim=80).to("cpu")
-                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                state_dict = (
-                    ckpt["model_state_dict"]
-                    if isinstance(ckpt, dict) and "model_state_dict" in ckpt
-                    else ckpt
-                )
-                actor_dict = {
-                    k: v for k, v in state_dict.items() if not k.startswith("critic")
-                }
-                model.load_state_dict(actor_dict, strict=False)
-                model.eval()
-                return RLController(model, team=opp_team, device="cpu", deterministic=True), display_label
-            except Exception as e:
-                print(f"[Warning] Failed to load {ckpt_path}: {e}. Falling back to Heuristic.")
-
+        # Fallback to Heuristic Bot if .npz file is missing
+        print(f"[Warning] Model {npz_path} not found. Falling back to Heuristic Bot.")
         coord = TeamHeuristicCoordinator(team=opp_team)
         return HeuristicBotController(coord), "Heuristic Bot"
 

@@ -17,6 +17,9 @@ class Pitch:
         self.width = width or cfg.DEFAULT_PITCH_WIDTH
         self.height = height or cfg.DEFAULT_PITCH_HEIGHT
 
+        # 1. Fully Dynamic Center Circle (22% of pitch height)
+        self.center_circle_radius = round(self.height * 0.22)
+
         # Inner Pitch Bounds (Ball bounces here)
         self.left = center.x - self.width / 2
         self.right = center.x + self.width / 2

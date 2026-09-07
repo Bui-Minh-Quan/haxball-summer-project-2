@@ -71,18 +71,26 @@ class Simulation:
             self.controllers.append(slot.controller)
 
     def reset_positions(self):
-        self.ball.pos = self.center.copy()
+        """Resets the ball and positions players dynamically based on pitch dimensions."""
+        self.ball.pos = Vec2(self.center.x, self.center.y)
         self.ball.vel = Vec2(0.0, 0.0)
 
-        y_step_red = self.pitch.height / (len(self.red_team) + 1)
-        for i, player in enumerate(self.red_team):
-            player.pos = Vec2(self.pitch.left + 200, self.pitch.top + y_step_red * (i + 1))
-            player.vel = Vec2(0.0, 0.0)
+        p = self.pitch
+        circle_r = p.center_circle_radius
+        kickoff_team = getattr(self.mode, "kickoff_team", "red")
 
-        y_step_blue = self.pitch.height / (len(self.blue_team) + 1)
-        for i, player in enumerate(self.blue_team):
-            player.pos = Vec2(self.pitch.right - 200, self.pitch.top + y_step_blue * (i + 1))
+        for player in self.all_players:
             player.vel = Vec2(0.0, 0.0)
+            is_kicking = player.team == kickoff_team
+
+            # Kicker starts near center ball; Defender starts outside the circle
+            if is_kicking:
+                offset_x = min(80.0, circle_r * 0.4)
+            else:
+                offset_x = circle_r + player.radius + 30.0
+
+            sign = -1.0 if player.team == "red" else 1.0
+            player.pos = Vec2(self.center.x + sign * offset_x, self.center.y)
 
     def step(self, dt: float) -> str | None:
         self.kicked_this_step = False

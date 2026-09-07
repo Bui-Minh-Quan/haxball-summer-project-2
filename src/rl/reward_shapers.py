@@ -299,8 +299,6 @@ class DenseReward_3(BaseRewardShaper):
     return reward, False, {"goal_event": goal_event}
 
 
-
-
 class DenseReward_4(BaseRewardShaper):
     """Exploit-free, asymmetric 2v2 reward without artificial crowding penalties."""
 

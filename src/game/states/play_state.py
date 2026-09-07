@@ -35,6 +35,7 @@ class PlayState(GameState):
 
         # UI Fonts
         self.font_score = pygame.font.SysFont("Arial", 26, bold=True)
+
         self.font_time = pygame.font.SysFont("Arial", 22, bold=True)
         self.font_player_num = pygame.font.SysFont("Arial", 22, bold=True)
         self.font_banner = pygame.font.SysFont("Arial", 68, bold=True)
@@ -60,18 +61,18 @@ class PlayState(GameState):
 
         # Celebration Sound
         self.sound_celebration = None
-        snd_cel = "assets/sounds/crowd/crowd_celebration.mp3"
+        snd_cel = "assets/sounds/crowd/crowd_celebration_1.mp3"
         if os.path.exists(snd_cel):
             try:
                 self.sound_celebration = pygame.mixer.Sound(snd_cel)
-                self.sound_celebration.set_volume(0.65)
+                self.sound_celebration.set_volume(0.25)
             except Exception as e:
                 print(f"Warning: Could not load celebration sound: {e}")
 
         # Ball Kick Sounds
         self.kick_sounds = []
         for path in [
-            "assets/sounds/balls/ball_kick1.wav",
+            "assets/sounds/balls/ball_kick4.wav",
             #"assets/sounds/balls/ball_kick2.wav",
             #"assets/sounds/balls/ball_kick3.mp3",
         ]:
@@ -299,7 +300,6 @@ class PlayState(GameState):
         halo_img = self._sprite_cache[cache_key]
         surface.blit(halo_img, halo_img.get_rect(center=pos))
 
-
     def _draw_net(self, surface: pygame.Surface, is_left: bool):
         p = self.sim.pitch
         cam = self.camera
@@ -359,7 +359,8 @@ class PlayState(GameState):
             cam.apply((p.center.x, p.bottom)), 3
         )
 
-        c_rad_world = int(p.height * 0.20)
+        c_rad_world = int(getattr(p, "center_circle_radius", p.height * 0.22))
+
         cx, cy = cam.apply((p.center.x, p.center.y))
         pygame.gfxdraw.aacircle(surface, cx, cy, c_rad_world, (240, 240, 240))
         pygame.gfxdraw.aacircle(surface, cx, cy, c_rad_world - 1, (240, 240, 240))
