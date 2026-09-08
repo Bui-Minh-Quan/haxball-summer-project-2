@@ -11,11 +11,13 @@ class Pitch:
         cfg: PhysicsConfig,
         width: float | None = None,
         height: float | None = None,
+        goal_height: float | None = None,
     ):
         self.cfg = cfg
         self.center = center
         self.width = width or cfg.DEFAULT_PITCH_WIDTH
         self.height = height or cfg.DEFAULT_PITCH_HEIGHT
+        self.goal_height = goal_height if goal_height is not None else cfg.GOAL_HEIGHT
 
         # 1. Fully Dynamic Center Circle (22% of pitch height)
         self.center_circle_radius = round(self.height * 0.22)
@@ -32,11 +34,11 @@ class Pitch:
         self.outer_top = self.top - cfg.HEIGHT_MARGIN
         self.outer_bottom = self.bottom + cfg.HEIGHT_MARGIN
 
-        # Goal Y-interval
-        self.goal_top = center.y - cfg.GOAL_HEIGHT / 2
-        self.goal_bottom = center.y + cfg.GOAL_HEIGHT / 2
+        # Dynamic Goal Y-interval based on self.goal_height
+        self.goal_top = center.y - self.goal_height / 2
+        self.goal_bottom = center.y + self.goal_height / 2
 
-        # Goal Posts
+        # Goal Posts dynamically positioned at the custom net mouth
         self.posts = [
             GoalPost(Vec2(self.left, self.goal_top), cfg),
             GoalPost(Vec2(self.left, self.goal_bottom), cfg),

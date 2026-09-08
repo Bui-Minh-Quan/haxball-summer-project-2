@@ -16,6 +16,7 @@ class Simulation:
         center_y: float = 400.0,
         match_config: MatchConfig | None = None,
         cfg: PhysicsConfig | None = None,
+        goal_height: float | None = None,
     ):
         self.cfg = cfg or PhysicsConfig()
         self.match_config = match_config or MatchConfig()
@@ -26,10 +27,16 @@ class Simulation:
 
         self.center = Vec2(center_x, center_y)
 
-        # Dynamic Pitch Dimensions
+        # Dynamic Pitch & Goal Dimensions
         pw = match_config.pitch_width if match_config else self.cfg.DEFAULT_PITCH_WIDTH
         ph = match_config.pitch_height if match_config else self.cfg.DEFAULT_PITCH_HEIGHT
-        self.pitch = Pitch(self.center, self.cfg, width=pw, height=ph)
+        
+        # Priority: explicit argument -> match_config attribute -> default (None)
+        gh = goal_height
+        if gh is None and match_config is not None:
+            gh = getattr(match_config, "goal_height", None)
+
+        self.pitch = Pitch(self.center, self.cfg, width=pw, height=ph, goal_height=gh)
 
         self.ball = Ball(self.center, self.cfg)
         self.all_players: list[Player] = []
