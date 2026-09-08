@@ -20,21 +20,22 @@ class PlayerStats:
 @dataclass
 class PlayerSlot:
     """Represents a single player slot in a team roster."""
-    team: str  # "red", "blue", "neutral"
+    team: str
     stats: PlayerStats = field(default_factory=PlayerStats)
     controller: Any = None
-    role: str = "AUTO"  # "AUTO", "GK", "ST", "CM", "LW", "RW"
+    role: str = "AUTO"
 
 
 @dataclass
 class MatchConfig:
     """Unified configuration object to initialize any game mode or simulation."""
 
-    mode: Any = None  # Instance of GameMode
+    mode: Any = None
     roster: list[PlayerSlot] = field(default_factory=list)
     pitch_width: float = 1200.0
     pitch_height: float = 800.0
-    time_limit: float = 180.0  # seconds (0 = infinite)
-    kickoff_timeout: float = 10.0  # Max seconds allowed to take kickoff
+    time_limit: float = 180.0
+    kickoff_timeout: float = 10.0
     score_limit: int = 3
-    game_speed: float = 0.4  # 1.0 = Normal, 0.5 = Slow-mo, 1.5 = Fast
+    game_speed: float = 0.4
+    goal_height: float | None = None  # None defaults to PhysicsConfig.GOAL_HEIGHT (200.0)

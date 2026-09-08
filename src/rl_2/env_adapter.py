@@ -181,19 +181,21 @@ class MatchEnv(gym.Env):
 
         self.current_step = 0
 
-        # Scenario Randomization: Sample match context
-        self.match_time_remaining = random.uniform(5.0, 60.0)
-        self.sim.score_red = random.randint(0, 3)
-        self.sim.score_blue = random.randint(0, 3)
+        # Stage 1: Clean 0-0 context. (Reserve random scoreboards for Stage 2+)
+        if self.goal_height and self.goal_height >= 400.0:
+            self.match_time_remaining = 15.0
+            self.sim.score_red = 0
+            self.sim.score_blue = 0
+        else:
+            self.match_time_remaining = random.uniform(10.0, 60.0)
+            self.sim.score_red = random.randint(0, 3)
+            self.sim.score_blue = random.randint(0, 3)
 
-        # Sync with match mode
         if hasattr(self.sim.mode, "time_remaining"):
             self.sim.mode.time_remaining = self.match_time_remaining
             self.sim.mode.state = "PLAYING"
 
-        # Position sampling
         self._sample_positions()
-
         return self._get_obs_payload(), {}
 
     def step(self, action):
@@ -246,18 +248,17 @@ class MatchEnv(gym.Env):
                 self.sim.score_red += 1
 
         # 6. Final Whistle Match Outcome Reward
-        # Awarded only when the overall match concludes during this episode
-        if is_match_timeout or (is_goal and self.match_time_remaining < 2.0):
+        if is_match_timeout and not (self.goal_height and self.goal_height >= 400.0):
             my_score = self.sim.score_red if self.learner_team == "red" else self.sim.score_blue
             opp_score = self.sim.score_blue if self.learner_team == "red" else self.sim.score_red
             score_diff = my_score - opp_score
 
             if score_diff > 0:
-                reward += 0.5 * score_diff   # Win match bonus
+                reward += 0.5 * score_diff
             elif score_diff < 0:
-                reward -= 0.5 * abs(score_diff)  # Loss penalty
+                reward -= 0.5 * abs(score_diff)
             else:
-                reward -= 0.25  # Stalemate/Draw dissatisfaction
+                reward -= 0.25
 
         info = {
             "goal_event": goal_event,

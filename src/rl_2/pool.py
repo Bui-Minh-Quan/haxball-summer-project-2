@@ -1,7 +1,7 @@
-# src/rl_2/pool.py
 import glob
 import os
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -13,7 +13,7 @@ from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
 from src.rl_2.env_adapter import RandomOpponentController
 from src.rl_2.model import ActorCritic
-from src.rl_2.obs import extract_actor_obs, extract_global_state
+from src.rl_2.obs import extract_actor_obs
 
 
 class PoolOpponentController(Controller):
@@ -48,20 +48,16 @@ class PoolOpponentController(Controller):
         ]
 
     def reset_opponent(self):
-        """Called by MatchEnv.reset() to resample opponent persona for the round."""
         roll = random.random()
 
-        # Mode 1: Random Baseline
         if roll < self.p_random or not self.pool_dir or not os.path.exists(self.pool_dir):
             self.current_mode = "random"
             return
 
-        # Mode 2: Heuristic Bot Baseline
         if roll < (self.p_random + self.p_heuristic):
             self.current_mode = "heuristic"
             return
 
-        # Mode 3: Self-Play Model from Pool
         history_files = glob.glob(os.path.join(self.pool_dir, "history_*.pt"))
         latest_file = os.path.join(self.pool_dir, "latest.pt")
         target_file = None
@@ -105,12 +101,14 @@ class PoolOpponentController(Controller):
 
 
 class SelfPlayPool:
-    """Manages snapshots, champions, and gauntlet evaluations."""
+    """Manages snapshots, champions, and progressive gauntlet promotions."""
 
     def __init__(self, pool_dir: str):
         self.pool_dir = pool_dir
         os.makedirs(self.pool_dir, exist_ok=True)
         self.champion_path = os.path.join(self.pool_dir, "champion.pt")
+        # Persistent record tracker: (win_rate, mean_reward, net_goals)
+        self.best_score = (-1.0, -float("inf"), -float("inf"))
 
     def save_latest(self, model: nn.Module):
         torch.save(model.state_dict(), os.path.join(self.pool_dir, "latest.pt"))
@@ -129,19 +127,27 @@ class SelfPlayPool:
         num_episodes: int = 20,
         team_size: int = 1,
         goal_height: float | None = None,
+        pitch_width: float = 840.0,
+        pitch_height: float = 500.0,
         max_steps: int = 900,
         device: torch.device = torch.device("cpu"),
+        eval_seed: int = 42,
     ) -> dict:
-        """Simulates evaluation matches with mirrored sides (half Red, half Blue)."""
         learner_model.eval()
         if opponent_model:
             opponent_model.eval()
+
+        random.seed(eval_seed)
+        np.random.seed(eval_seed)
+        torch.manual_seed(eval_seed)
+        
 
         wins = 0
         losses = 0
         draws = 0
         total_scored = 0
         total_conceded = 0
+        ep_rewards = []
 
         _ego_dirs = [
             (0.0, 0.0),   (0.0, -1.0),  (0.0, 1.0),
@@ -179,11 +185,32 @@ class SelfPlayPool:
                 mode=ClassicMatchMode(time_limit=max_steps / 60.0, score_limit=99),
                 roster=roster,
                 goal_height=goal_height,
+                pitch_width=pitch_width,
+                pitch_height=pitch_height,
             )
             sim = Simulation(match_config=cfg, goal_height=goal_height)
 
+            # Stage 1 Curriculum position reset during evaluation
+            if goal_height and goal_height >= 400.0:
+                sim.ball.pos.x = sim.center.x + random.uniform(-40.0, 60.0)
+                sim.ball.pos.y = sim.center.y + random.uniform(-60.0, 60.0)
+                sim.ball.vel = Vec2(0.0, 0.0)
+
+                l_squad = sim.red_team if learner_team == "red" else sim.blue_team
+                for pl in l_squad:
+                    pl.pos.x = sim.ball.pos.x - (sign * random.uniform(60.0, 100.0))
+                    pl.pos.y = sim.ball.pos.y + random.uniform(-25.0, 25.0)
+                    pl.vel = Vec2(0.0, 0.0)
+
+                o_squad = sim.blue_team if learner_team == "red" else sim.red_team
+                opp_back_x = sim.pitch.right - 120.0 if learner_team == "red" else sim.pitch.left + 120.0
+                for pl in o_squad:
+                    pl.pos.x = opp_back_x
+                    pl.pos.y = sim.center.y + random.uniform(-80.0, 80.0)
+                    pl.vel = Vec2(0.0, 0.0)
+
+            ep_rew = 0.0
             for _ in range(max_steps):
-                # 1. Learner actions
                 l_squad = sim.red_team if learner_team == "red" else sim.blue_team
                 for idx, player in enumerate(l_squad):
                     obs = extract_actor_obs(sim, player, learner_team)
@@ -194,7 +221,6 @@ class SelfPlayPool:
                     ex, ey = _ego_dirs[m_idx]
                     learner_placeholders[idx].action = (Vec2(ex * sign, ey), bool(act[0, 1].item()))
 
-                # 2. Model opponent actions
                 if opponent_type == "model" and opponent_model:
                     o_squad = sim.blue_team if learner_team == "red" else sim.red_team
                     for idx, opp_player in enumerate(o_squad):
@@ -207,10 +233,17 @@ class SelfPlayPool:
                         opp_placeholders[idx].action = (Vec2(ex * -sign, ey), bool(act[0, 1].item()))
 
                 goal = sim.step(1.0 / 60.0)
-                if goal is not None:
+                ep_rew -= 0.001  # Exact step penalty matching training
+
+                if goal == f"{learner_team}_goal":
+                    ep_rew += 1.0
+                    break
+                elif goal is not None:
+                    ep_rew -= 1.0
                     break
 
-            # Outcome assessment
+            ep_rewards.append(ep_rew)
+
             scored = sim.score_red if learner_team == "red" else sim.score_blue
             conceded = sim.score_blue if learner_team == "red" else sim.score_red
 
@@ -225,61 +258,83 @@ class SelfPlayPool:
                 draws += 1
 
         learner_model.train()
+        mean_reward = float(np.mean(ep_rewards))
+        win_rate = wins / max(1, num_episodes)
+        net_goals = total_scored - total_conceded
+
         return {
             "wins": wins,
             "losses": losses,
             "draws": draws,
-            "win_rate": wins / max(1, num_episodes),
+            "win_rate": win_rate,
+            "mean_reward": round(mean_reward, 3),
             "scored": total_scored,
             "conceded": total_conceded,
-            "net": total_scored - total_conceded,
+            "net": net_goals,
+            "score_tuple": (win_rate, round(mean_reward, 3), net_goals),
         }
 
     def run_gatekeeper_gauntlet(
         self,
         learner_model: nn.Module,
-        active_tiers: list[str],  # e.g. ["random"], ["random", "heuristic"], or ["heuristic", "champion"]
+        active_tiers: list[str],
         team_size: int = 1,
         goal_height: float | None = None,
+        pitch_width: float = 840.0,
+        pitch_height: float = 500.0,
+        num_episodes: int = 50,
         device: torch.device = torch.device("cpu"),
-    ) -> tuple[bool, dict]:
-        """Runs sequential gatekeeper trials. Must pass tier N to attempt tier N+1."""
+    ) -> tuple[bool, dict, tuple]:
+        """Evaluates tiers and verifies candidate strictly beats previous best score."""
         results = {}
 
-        # Tier 1: Random Bot
+        # 1. Tier: Random Bot
         if "random" in active_tiers:
-            r1 = self.evaluate_matchup(
+            r_rand = self.evaluate_matchup(
                 learner_model, opponent_type="random", team_size=team_size,
-                goal_height=goal_height, device=device, num_episodes=20
+                goal_height=goal_height, pitch_width=pitch_width, pitch_height=pitch_height,
+                device=device, num_episodes=num_episodes
             )
-            results["random"] = r1
-            if r1["win_rate"] < 0.85:
-                return False, results
+            results["random"] = r_rand
 
-        # Tier 2: Heuristic Bot
+            # Minimum competency gate (must win at least 60% before checking promotion)
+            if r_rand["win_rate"] < 0.60:
+                return False, results, self.best_score
+
+        # 2. Tier: Heuristic Bot
         if "heuristic" in active_tiers:
-            r2 = self.evaluate_matchup(
+            r_heur = self.evaluate_matchup(
                 learner_model, opponent_type="heuristic", team_size=team_size,
-                goal_height=goal_height, device=device, num_episodes=20
+                goal_height=goal_height, pitch_width=pitch_width, pitch_height=pitch_height,
+                device=device, num_episodes=num_episodes
             )
-            results["heuristic"] = r2
-            if r2["win_rate"] < 0.60 or r2["net"] < 5:
-                return False, results
+            results["heuristic"] = r_heur
+            if r_heur["win_rate"] < 0.50 or r_heur["net"] < 2:
+                return False, results, self.best_score
 
-        # Tier 3: Current Champion Snapshot
+        # 3. Tier: Self-Play Champion
         if "champion" in active_tiers and os.path.exists(self.champion_path):
             champ = ActorCritic().to(device)
             ckpt = torch.load(self.champion_path, map_location=device, weights_only=False)
             champ.load_state_dict(ckpt)
             champ.eval()
 
-            r3 = self.evaluate_matchup(
+            r_champ = self.evaluate_matchup(
                 learner_model, opponent_type="model", opponent_model=champ,
-                team_size=team_size, goal_height=goal_height, device=device, num_episodes=30
+                team_size=team_size, goal_height=goal_height, pitch_width=pitch_width,
+                pitch_height=pitch_height, device=device, num_episodes=num_episodes
             )
-            results["champion"] = r3
-            # Must decisively beat previous best
-            if r3["win_rate"] < 0.55 or r3["net"] < 3:
-                return False, results
+            results["champion"] = r_champ
+            if r_champ["win_rate"] < 0.55 or r_champ["net"] < 2:
+                return False, results, self.best_score
 
-        return True, results
+        # Progressive Record Promotion: Primary evaluation target is the highest active tier
+        primary_tier = active_tiers[-1]
+        candidate_score = results[primary_tier]["score_tuple"]
+
+        if candidate_score > self.best_score:
+            prev_score = self.best_score
+            self.best_score = candidate_score
+            return True, results, prev_score
+
+        return False, results, self.best_score

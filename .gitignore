@@ -219,6 +219,7 @@ __marimo__/
 
 # pytorch models
 training/models/*
+*.pt 
 
 # Replay render files
 training/render/*
