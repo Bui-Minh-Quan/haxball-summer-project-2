@@ -95,73 +95,87 @@ class MatchEnv(gym.Env):
         self._init_simulation()
 
     def _init_simulation(self):
-        roster = []
-        self.learner_slots = []
+      roster = []
+      self.learner_slots = []
+      self.opp_slots = []
 
-        # Learner slots
-        for i in range(self.team_size):
-            ph = ActionPlaceholder()
-            slot = PlayerSlot(self.learner_team, PlayerStats(f"Learner_{i+1}", accel=3200.0), ph)
-            roster.append(slot)
-            self.learner_slots.append((i, slot))
-
-        # Opponent slots
-        for j in range(self.team_size):
-            slot = PlayerSlot(self.opp_team, PlayerStats(f"Opponent_{j+1}", accel=3200.0), self.opponent_controller)
-            roster.append(slot)
-
-        match_cfg = MatchConfig(
-            mode=ClassicMatchMode(time_limit=60.0, score_limit=99),
-            roster=roster,
-            pitch_width=self.pitch_width,
-            pitch_height=self.pitch_height,
-            goal_height=self.goal_height,
+      # Learner slots
+      for i in range(self.team_size):
+        ph = ActionPlaceholder()
+        slot = PlayerSlot(
+            self.learner_team,
+            PlayerStats(f"Learner_{i+1}", accel=3200.0),
+            ph,
         )
-        self.sim = Simulation(
-            center_x=self.pitch_width / 2.0,
-            center_y=self.pitch_height / 2.0,
-            match_config=match_cfg,
-            goal_height=self.goal_height,
+        roster.append(slot)
+        self.learner_slots.append((i, slot))
+
+      # Opponent slots (Now also using ActionPlaceholder!)
+      for j in range(self.team_size):
+        ph_opp = ActionPlaceholder()
+        slot = PlayerSlot(
+            self.opp_team,
+            PlayerStats(f"Opponent_{j+1}", accel=3200.0),
+            ph_opp,
         )
+        roster.append(slot)
+        self.opp_slots.append((j, slot))
+
+      match_cfg = MatchConfig(
+          mode=ClassicMatchMode(time_limit=60.0, score_limit=99),
+          roster=roster,
+          pitch_width=self.pitch_width,
+          pitch_height=self.pitch_height,
+          goal_height=self.goal_height,
+      )
+      self.sim = Simulation(
+          center_x=self.pitch_width / 2.0,
+          center_y=self.pitch_height / 2.0,
+          match_config=match_cfg,
+          goal_height=self.goal_height,
+      )
 
     def _sample_positions(self):
-        """Randomizes player and ball positions with clearance checks."""
+        """Randomizes player and ball positions anywhere across the entire pitch."""
         p = self.sim.pitch
         ball = self.sim.ball
 
-        # 1. Randomize Ball
-        ball.pos.x = random.uniform(self.sim.center.x - 140.0, self.sim.center.x + 140.0)
-        ball.pos.y = random.uniform(p.top + 80.0, p.bottom - 80.0)
+        # Safe padding from the boundaries so objects don't spawn clipped inside walls
+        margin_x = 60.0
+        margin_y = 50.0
+
+        # 1. Ball spawns anywhere across the pitch
+        ball.pos.x = random.uniform(p.left + margin_x, p.right - margin_x)
+        ball.pos.y = random.uniform(p.top + margin_y, p.bottom - margin_y)
         ball.vel = Vec2(0.0, 0.0)
 
-        # Helper to find valid spawn location
-        def get_valid_pos(x_min, x_max, existing):
-            for _ in range(50):
-                x = random.uniform(x_min, x_max)
-                y = random.uniform(p.top + 50.0, p.bottom - 50.0)
+        # 2. Helper to find valid spawn location across the whole arena
+        def get_valid_pos(existing: list[Vec2]) -> Vec2:
+            for _ in range(100):
+                x = random.uniform(p.left + margin_x, p.right - margin_x)
+                y = random.uniform(p.top + margin_y, p.bottom - margin_y)
                 pos = Vec2(x, y)
-                if pos.distance_to(ball.pos) < 60.0:
+
+                # Keep clear from the ball so players don't immediately trigger a collision on frame 0
+                if pos.distance_to(ball.pos) < 55.0:
                     continue
-                if any(pos.distance_to(other) < 55.0 for other in existing):
+
+                # Keep clear from other spawned players
+                if any(pos.distance_to(other) < 50.0 for other in existing):
                     continue
+
                 return pos
-            return Vec2((x_min + x_max) / 2.0, self.sim.center.y)
 
-        spawned = []
-        # Red Team on Left
-        for red in self.sim.red_team:
-            pos = get_valid_pos(p.left + 60.0, self.sim.center.x + 30.0, spawned)
-            red.pos = pos
-            red.vel = Vec2(0.0, 0.0)
-            red.kick_cooldown_timer = 0.0
-            spawned.append(pos)
+            # Safe fallback if rejection sampling exceeds attempts
+            return Vec2(self.sim.center.x, self.sim.center.y)
 
-        # Blue Team on Right
-        for blue in self.sim.blue_team:
-            pos = get_valid_pos(self.sim.center.x - 30.0, p.right - 60.0, spawned)
-            blue.pos = pos
-            blue.vel = Vec2(0.0, 0.0)
-            blue.kick_cooldown_timer = 0.0
+        # 3. Spawn all players anywhere on the field regardless of team
+        spawned: list[Vec2] = []
+        for player in self.sim.all_players:
+            pos = get_valid_pos(spawned)
+            player.pos = pos
+            player.vel = Vec2(0.0, 0.0)
+            player.kick_cooldown_timer = 0.0
             spawned.append(pos)
 
     def _get_obs_payload(self) -> dict[str, np.ndarray]:
@@ -180,6 +194,10 @@ class MatchEnv(gym.Env):
             np.random.seed(seed)
 
         self.current_step = 0
+
+        # Cycle the opponent type!
+        if hasattr(self.opponent_controller, "reset_opponent"):
+            self.opponent_controller.reset_opponent()
 
         # Stage 1: Clean 0-0 context. (Reserve random scoreboards for Stage 2+)
         if self.goal_height and self.goal_height >= 400.0:
@@ -200,65 +218,80 @@ class MatchEnv(gym.Env):
 
     def step(self, action):
         dt = 1.0 / 60.0
-        self.current_step += 1
-        self.match_time_remaining = max(0.0, self.match_time_remaining - dt)
+        action_repeat = 4
 
-        if hasattr(self.sim.mode, "time_remaining"):
-            self.sim.mode.time_remaining = self.match_time_remaining
-
-        # 1. Apply Learner Actions
+        # 1. Update Learner Actions
         sign = 1.0 if self.learner_team == "red" else -1.0
         actions = [action] if self.team_size == 1 else action
-
         for i, (_, slot) in enumerate(self.learner_slots):
             m_idx = int(actions[i][0])
             kick = bool(actions[i][1])
             ego_x, ego_y = self._ego_dirs[m_idx]
             slot.controller.action = (Vec2(ego_x * sign, ego_y), kick)
 
-        # 2. Advance Physics Substeps
-        goal_event = self.sim.step(dt)
+        # 2. Update Opponent Actions ONCE per decision (15 Hz)
+        opp_sign = -1.0 if self.learner_team == "red" else 1.0
+        for j, slot in self.opp_slots:
+            opp_action = self.opponent_controller.get_action(j, self.sim)
+            slot.controller.action = opp_action
 
-        # 3. Base Per-Step Urgency Penalty
-        reward = -0.001
+        total_reward = 0.0
+        goal_event = None
+        terminated = False
+        truncated = False
 
-        # 4. Check Terminations
-        is_goal = goal_event is not None
-        is_round_timeout = self.current_step >= self.max_round_steps
-        is_match_timeout = self.match_time_remaining <= 0.0
+        # 3. Advance Physics (Both sides maintain actions across the 4 substeps)
+        for _ in range(action_repeat):
+            self.current_step += 1
+            self.match_time_remaining = max(0.0, self.match_time_remaining - dt)
 
-        terminated = is_goal
-        truncated = (is_round_timeout or is_match_timeout) and not terminated
+            if hasattr(self.sim.mode, "time_remaining"):
+                self.sim.mode.time_remaining = self.match_time_remaining
 
-        # 5. Reward Calculation
-        scored = goal_event == f"{self.learner_team}_goal"
-        conceded = is_goal and not scored
+            step_goal = self.sim.step(dt)
+            if step_goal is not None and goal_event is None:
+                goal_event = step_goal
 
-        if scored:
-            reward += 1.0
-            if self.learner_team == "red":
-                self.sim.score_red += 1
+            total_reward -= 0.0002
+
+            is_goal = goal_event is not None
+            is_round_timeout = self.current_step >= self.max_round_steps
+            is_match_timeout = self.match_time_remaining <= 0.0
+
+            terminated = is_goal
+            truncated = (is_round_timeout or is_match_timeout) and not terminated
+
+            if terminated or truncated:
+                break
+
+        # 3. Apply Goal Rewards
+        if terminated:
+            scored = goal_event == f"{self.learner_team}_goal"
+            if scored:
+                total_reward += 1.0
+                if self.learner_team == "red":
+                    self.sim.score_red += 1
+                else:
+                    self.sim.score_blue += 1
             else:
-                self.sim.score_blue += 1
-        elif conceded:
-            reward -= 1.0
-            if self.learner_team == "red":
-                self.sim.score_blue += 1
-            else:
-                self.sim.score_red += 1
+                total_reward -= 1.0
+                if self.learner_team == "red":
+                    self.sim.score_blue += 1
+                else:
+                    self.sim.score_red += 1
 
-        # 6. Final Whistle Match Outcome Reward
-        if is_match_timeout and not (self.goal_height and self.goal_height >= 400.0):
+        # 4. Final Whistle Match Outcome Reward
+        if truncated and is_match_timeout and not (self.goal_height and self.goal_height >= 400.0):
             my_score = self.sim.score_red if self.learner_team == "red" else self.sim.score_blue
             opp_score = self.sim.score_blue if self.learner_team == "red" else self.sim.score_red
             score_diff = my_score - opp_score
 
             if score_diff > 0:
-                reward += 0.5 * score_diff
+                total_reward += 0.5 * score_diff
             elif score_diff < 0:
-                reward -= 0.5 * abs(score_diff)
+                total_reward -= 0.5 * abs(score_diff)
             else:
-                reward -= 0.25
+                total_reward -= 0.25
 
         info = {
             "goal_event": goal_event,
@@ -267,4 +300,4 @@ class MatchEnv(gym.Env):
             "score_blue": self.sim.score_blue,
         }
 
-        return self._get_obs_payload(), float(reward), terminated, truncated, info
+        return self._get_obs_payload(), float(total_reward), terminated, truncated, info

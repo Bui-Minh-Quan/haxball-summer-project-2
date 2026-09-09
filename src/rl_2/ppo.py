@@ -18,8 +18,8 @@ def train_mappo(
     total_timesteps: int = 10_000_000,
     num_envs: int = 16,
     num_steps: int = 256,
-    update_epochs: int = 4,
-    minibatch_size: int = 256,
+    update_epochs: int = 2,
+    minibatch_size: int = 512,
     lr_init: float = 3e-4,
     lr_final: float = 1e-5,
     ent_coef_init: float = 0.015,
@@ -30,17 +30,20 @@ def train_mappo(
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     eval_freq: int = 100_000,
-    eval_episodes: int = 50,
+    eval_episodes: int = 40,
     active_tiers: list[str] | None = None,
+    target_tier: str = "random",                          
+    filter_thresholds: dict[str, float] | None = None,    
     goal_height: float | None = None,
     save_dir: str = "models/stage1",
     pool_dir: str | None = None,
     pitch_width: float = 840.0,
-    pitch_height: float = 500.0 
+    pitch_height: float = 500.0,
+    max_steps: int = 900,
 ):
     """Clean, production-grade Vectorized MAPPO loop with Centralized Critic."""
     os.makedirs(save_dir, exist_ok=True)
-    # Always initialize pool (defaults to save_dir/pool if not provided)
+    # Initialize pool (defaults to save_dir/pool if not provided)
     effective_pool_dir = pool_dir or os.path.join(save_dir, "pool")
     pool = SelfPlayPool(effective_pool_dir)
     eval_tiers = active_tiers or ["random"]
@@ -163,7 +166,12 @@ def train_mappo(
         b_returns = returns.reshape(-1)
 
         # Normalize advantages
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        adv_std = b_advantages.std()
+        if adv_std > 1e-4:
+            b_advantages = (b_advantages - b_advantages.mean()) / (adv_std + 1e-8)
+        else:
+        # Dry batch: zero out advantages so the policy takes zero gradient steps
+            b_advantages = torch.zeros_like(b_advantages)
 
         b_indices = np.arange(batch_size)
         for _ in range(update_epochs):
@@ -212,22 +220,27 @@ def train_mappo(
             passed, eval_metrics, recorded_score = pool.run_gatekeeper_gauntlet(
                 learner_model=model,
                 active_tiers=eval_tiers,
+                target_tier=target_tier,
+                filter_thresholds=filter_thresholds,
                 team_size=team_size,
                 goal_height=goal_height,
                 pitch_width=pitch_width,
                 pitch_height=pitch_height,
                 device=device,
-                num_episodes=eval_episodes
+                num_episodes=eval_episodes,
+                max_steps=max_steps,
             )
 
             for tier_name, res in eval_metrics.items():
+                is_filter = tier_name in (filter_thresholds or {})
+                is_target = tier_name == target_tier
+                role_tag = "[TARGET]" if is_target else ("[FILTER]" if is_filter else "")
                 print(
-                    f"   ⚔️  vs {tier_name.capitalize():<9} | WR: {res['win_rate']*100:5.1f}% | "
+                    f"   ⚔️  vs {tier_name.capitalize():<9} {role_tag:<8} | WR: {res['win_rate']*100:5.1f}% | "
                     f"Reward: {res['mean_reward']:+.3f} | Goals: {res['scored']} Scored, {res['conceded']} Conceded ({res['net']:+d} Net)"
                 )
 
-            primary_tier = eval_tiers[-1]
-            cand = eval_metrics.get(primary_tier, {})
+            cand = eval_metrics.get(target_tier, {})
 
             if passed:
                 save_path = os.path.join(save_dir, "best_model.pt")
@@ -237,7 +250,7 @@ def train_mappo(
                 prev_wr = f"{recorded_score[0]*100:.1f}%" if recorded_score[0] >= 0 else "None"
                 prev_rew = f"{recorded_score[1]:+.3f}" if recorded_score[0] >= 0 else "None"
                 print(
-                    f"   ⭐⭐ PROMOTED! New Best Score -> [WR: {cand['win_rate']*100:.1f}%, Reward: {cand['mean_reward']:+.3f}, Net: {cand['net']:+d}]\n"
+                    f"   ⭐⭐ PROMOTED! New Best Score ({target_tier}) -> [WR: {cand['win_rate']*100:.1f}%, Reward: {cand['mean_reward']:+.3f}, Net: {cand['net']:+d}]\n"
                     f"      (Defeated previous record: [WR: {prev_wr}, Reward: {prev_rew}]) -> Saved: {save_path}"
                 )
             else:
@@ -245,9 +258,9 @@ def train_mappo(
                 best_rew = f"{recorded_score[1]:+.3f}" if recorded_score[0] >= 0 else "None"
                 best_net = f"{recorded_score[2]:+d}" if recorded_score[0] >= 0 else "None"
                 print(
-                    f"   ❌ Retaining current baseline. Did not beat record: [WR: {best_wr}, Reward: {best_rew}, Net: {best_net}]"
+                    f"   ❌ Retaining current baseline. Did not pass criteria for {target_tier}: [WR: {best_wr}, Reward: {best_rew}, Net: {best_net}]"
                 )
-
+                
     # Save final model state
     final_path = os.path.join(save_dir, "final_model.pt")
     torch.save(model.state_dict(), final_path)
