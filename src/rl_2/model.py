@@ -49,27 +49,28 @@ class ActorCritic(nn.Module):
             nn.LayerNorm(256),
             nn.GELU(),
             ResidualBlock(256),
-            layer_init(nn.Linear(256, 128)),
-            nn.LayerNorm(128),
-            nn.GELU(),
-        )
-        self.actor_move = layer_init(nn.Linear(128, move_dim), std=0.01)
-        self.actor_kick = layer_init(nn.Linear(128, kick_dim), std=0.01)
-
-        # --- CRITIC TOWER (Centralized Training) ---
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(self.state_dim, 256)),
+            ResidualBlock(256),
+            layer_init(nn.Linear(256, 256)),
             nn.LayerNorm(256),
             nn.GELU(),
-            ResidualBlock(256),
-            layer_init(nn.Linear(256, 128)),
-            nn.LayerNorm(128),
+        )
+        self.actor_move = layer_init(nn.Linear(256, move_dim), std=0.01)
+        self.actor_kick = layer_init(nn.Linear(256, kick_dim), std=0.01)
+
+        # --- CRITIC TOWER (Centralized Training: 512-Width High-Capacity) ---
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(self.state_dim, 512)),
+            nn.LayerNorm(512),
             nn.GELU(),
-            layer_init(nn.Linear(128, 1), std=1.0),
+            ResidualBlock(512),
+            ResidualBlock(512),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
 
     def get_value(self, state: torch.Tensor) -> torch.Tensor:
-        """Critic evaluates the centralized global state."""
         return self.critic(state).squeeze(-1)
 
     def forward(self, obs: torch.Tensor, state: torch.Tensor | None = None):
@@ -112,7 +113,6 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, value
 
     def load_actor_weights(self, checkpoint_path: str, device: torch.device):
-        """Bootstraps Actor weights from previous stage while keeping a fresh Critic."""
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
 
