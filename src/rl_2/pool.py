@@ -341,11 +341,6 @@ class SelfPlayPool:
           goal = sim.step(1.0 / 60.0)
 
           if goal is not None:
-            if goal == "red_goal":
-              sim.score_red += 1
-            elif goal == "blue_goal":
-              sim.score_blue += 1
-
             scored = goal == f"{learner_team}_goal"
             ep_rew += 1.0 if scored else -1.0
 
@@ -367,7 +362,7 @@ class SelfPlayPool:
         ep_rew -= 1.0 + 0.1 * abs(diff)
         losses += 1
       else:
-        ep_rew -= 0.1
+        ep_rew -= 0.5
         draws += 1
 
       total_scored += scored
@@ -489,8 +484,8 @@ class SelfPlayPool:
     cand_score = cand["score_tuple"]
 
     if target_tier == "champion":
-      # Enforces strict 40%+ win rate and +7 net goal differential
-      is_promoted = cand["win_rate"] >= 0.40 and cand["net"] >= 7
+      # Enforces strict 35%+ win rate and +5 net goal differential
+      is_promoted = cand["win_rate"] >= 0.35 and cand["net"] >= 5
       return is_promoted, results, cand_score
 
     if cand_score > self.best_score:

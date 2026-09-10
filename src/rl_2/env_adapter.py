@@ -139,7 +139,7 @@ class MatchEnv(gym.Env):
           ph_opp,
       )
       roster.append(slot)
-      self.opp_slots.append((j, slot))
+      self.opp_slots.append((self.team_size + j, slot))
 
     match_cfg = MatchConfig(
         mode=ClassicMatchMode(
@@ -222,8 +222,9 @@ class MatchEnv(gym.Env):
       return
 
     # ── 3. Phase 2 & 3: Regulation Equidistant Point-Symmetric Contest ──
-    margin_x = min(240.0, pitch_w * 0.22)
-    margin_y = min(110.0, pitch_h * 0.18)
+    # Allow the ball to spawn across the broader central 65% of the pitch
+    margin_x = min(200.0, pitch_w * 0.18)
+    margin_y = min(90.0, pitch_h * 0.14)
     bx = random.uniform(p.left + margin_x, p.right - margin_x)
     by = random.uniform(p.top + margin_y, p.bottom - margin_y)
     ball.pos = Vec2(bx, by)
@@ -231,18 +232,24 @@ class MatchEnv(gym.Env):
 
     safe_m = 45.0
     placed = False
-    max_dist = min(220.0, pitch_w * 0.20)
 
-    for _ in range(40):
-      dist = random.uniform(150.0, max_dist)
-      # Strictly forward angles: cos(angle) > 0 guarantees Red is to the left of the ball
-      angle = random.uniform(-math.pi / 4, math.pi / 4)
+    # Dynamic distance range: supports close duels (120px) up to deep recoveries (420px)
+    max_possible_dist = min(420.0, pitch_w * 0.36)
+    min_dist = 120.0
+
+    for _ in range(50):
+      # Sample diverse tactical depths across duels, mid-pitch, and deep transition play
+      dist = random.uniform(min_dist, max_possible_dist)
+
+      # Widen approach arc to [-60°, +60°] (cos(angle) >= 0.5 guarantees Red stays on defense side)
+      angle = random.uniform(-math.pi / 3, math.pi / 3)
       vx = dist * math.cos(angle)
       vy = dist * math.sin(angle)
 
       r_x, r_y = bx - vx, by - vy
       b_x, b_y = bx + vx, by + vy
 
+      # Verify both players remain safely within the field boundaries
       if (
           p.left + safe_m <= r_x <= p.right - safe_m
           and p.top + safe_m <= r_y <= p.bottom - safe_m
@@ -264,7 +271,9 @@ class MatchEnv(gym.Env):
 
     if not placed:
       self._reset_pitch_state(standard_kickoff=True)
-      
+
+
+
   def _get_obs_payload(self) -> dict[str, np.ndarray]:
     team_squad = (
         self.sim.red_team
@@ -335,11 +344,6 @@ class MatchEnv(gym.Env):
       # In-Match Continuous Goal Handling
       if goal_event is not None:
         scored = goal_event == f"{self.learner_team}_goal"
-        if goal_event == "red_goal":
-          self.sim.score_red += 1
-        elif goal_event == "blue_goal":
-          self.sim.score_blue += 1
-
         total_reward += 1.0 if scored else -1.0
 
         # Restart immediately via 20/80 setup without terminating match

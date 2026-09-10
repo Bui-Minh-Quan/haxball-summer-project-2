@@ -1,10 +1,10 @@
+import json
+import math
 import os
-import matplotlib.animation as animation
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
+import random
 import numpy as np
 import torch
-from IPython.display import HTML, display
+import torch.nn as nn
 
 from config.match_config import MatchConfig, PlayerSlot, PlayerStats
 from src.bots.heuristic_bot import TeamHeuristicCoordinator
@@ -12,266 +12,723 @@ from src.engine.controllers import Controller, HeuristicBotController
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
-from src.rl_2.env_adapter import RandomOpponentController
 from src.rl_2.model import ActorCritic
-from src.rl_2.obs import extract_actor_obs
+from src.rl_2.obs import ACTOR_OBS_DIM, extract_actor_obs
+
+_EGO_DIRS = [
+    (0.0, 0.0),  # 0: None
+    (0.0, -1.0),  # 1: Up
+    (0.0, 1.0),  # 2: Down
+    (-1.0, 0.0),  # 3: Backward
+    (1.0, 0.0),  # 4: Forward
+    (-1.0, -1.0),  # 5: Backward-Up
+    (1.0, -1.0),  # 6: Forward-Up
+    (-1.0, 1.0),  # 7: Backward-Down
+    (1.0, 1.0),  # 8: Forward-Down
+]
 
 
-def render_match_video(
-    model_path: str = "models/stage2/final_model.pt",
-    opponent_type: str = "random",  # "random" or "heuristic"
+class ActionPlaceholder(Controller):
+  """Holds discrete actions across 4 physics substeps to match training (15 Hz)."""
+
+  def __init__(self):
+    self.action = (Vec2(0.0, 0.0), False)
+
+  def get_action(self, player_idx: int, sim: Simulation) -> tuple[Vec2, bool]:
+    return self.action
+
+
+def _apply_eval_restart(
+    sim: Simulation,
+    ep_idx: int,
+    is_initial: bool = False,
     pitch_width: float = 1200.0,
     pitch_height: float = 800.0,
-    goal_height: float = 220.0,
-    max_steps: int = 900,
-    frame_skip: int = 2,  # Renders every 2nd frame (30fps playback)
-    save_path: str | None = None,  # e.g., "replay.mp4" or "replay.gif"
 ):
-  device = torch.device("cpu")
-  ego_dirs = [
-      (0.0, 0.0),
-      (0.0, -1.0),
-      (0.0, 1.0),
-      (-1.0, 0.0),
-      (1.0, 0.0),
-      (-1.0, -1.0),
-      (1.0, -1.0),
-      (-1.0, 1.0),
-      (1.0, 1.0),
-  ]
+  """Deterministic point-symmetric spatial gauntlet across episodes."""
+  p = sim.pitch
+
+  # 20% Canonical center kickoff on match start; 80% point-symmetric gauntlet
+  if (ep_idx % 5 == 0) and is_initial:
+    sim.ball.pos = Vec2(sim.center.x, sim.center.y)
+    sim.ball.vel = Vec2(0.0, 0.0)
+    sim.red_team[0].pos = Vec2(sim.center.x - 140.0, sim.center.y)
+    sim.red_team[0].vel = Vec2(0.0, 0.0)
+    sim.red_team[0].kick_cooldown_timer = 0.0
+
+    sim.blue_team[0].pos = Vec2(sim.center.x + 140.0, sim.center.y)
+    sim.blue_team[0].vel = Vec2(0.0, 0.0)
+    sim.blue_team[0].kick_cooldown_timer = 0.0
+  else:
+    # Deterministic spatial parameter sweep across quadrants and wings
+    sweep_idx = (
+        ep_idx
+        if is_initial
+        else (ep_idx + int(sim.score_red + sim.score_blue) * 7)
+    )
+
+    max_dist = min(180.0, pitch_width * 0.22)
+    dist = max_dist * (0.75 + (sweep_idx % 4) * 0.08)
+    angle = -math.pi / 4 + ((sweep_idx * 31.0) % 90.0) * (math.pi / 180.0)
+
+    bx = sim.center.x + (((sweep_idx % 3) - 1) * (pitch_width * 0.12))
+    by = sim.center.y + ((((sweep_idx // 3) % 3) - 1) * (pitch_height * 0.15))
+
+    sim.ball.pos = Vec2(bx, by)
+    sim.ball.vel = Vec2(0.0, 0.0)
+
+    vx = dist * math.cos(angle)
+    vy = dist * math.sin(angle)
+
+    sim.red_team[0].pos = Vec2(bx - vx, by - vy)
+    sim.red_team[0].vel = Vec2(0.0, 0.0)
+    sim.red_team[0].kick_cooldown_timer = 0.0
+
+    sim.blue_team[0].pos = Vec2(bx + vx, by + vy)
+    sim.blue_team[0].vel = Vec2(0.0, 0.0)
+    sim.blue_team[0].kick_cooldown_timer = 0.0
+
+  # Neutralize mode state to prevent background resets
+  if hasattr(sim, "mode"):
+    sim.mode.state = "PLAYING"
+    if hasattr(sim.mode, "celebration_timer"):
+      sim.mode.celebration_timer = 0.0
+    if hasattr(sim.mode, "goal_timer"):
+      sim.mode.goal_timer = 0.0
+
+
+def evaluate_and_generate_html(
+    model_or_path: str | nn.Module,
+    device: torch.device = torch.device("cpu"),
+    baseline_type: str = "heuristic",
+    output_dir: str = "render/",
+    filename: str = "match_replay.html",
+    num_episodes: int = 10,
+    max_steps: int = 1800,
+    base_seed: int = 70000,
+    pitch_width: float = 1200.0,
+    pitch_height: float = 800.0,
+    goal_height: float | None = 220.0,
+) -> str:
+  """Runs continuous matches and exports an interactive HTML5 visual replay."""
+  os.makedirs(output_dir, exist_ok=True)
+  out_path = os.path.join(output_dir, filename)
 
   # 1. Load Model
-  model = ActorCritic().to(device)
-  if os.path.exists(model_path):
-    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+  if isinstance(model_or_path, str):
+    model = ActorCritic().to(device)
+    ckpt = torch.load(model_or_path, map_location=device, weights_only=False)
     state_dict = (
         ckpt["model_state_dict"]
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt
         else ckpt
     )
-    model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded weights from: {model_path}")
+    model.load_state_dict(state_dict)
   else:
-    print(f"⚠️ Model path {model_path} not found. Running untrained weights.")
+    model = model_or_path.to(device)
+
   model.eval()
 
-  # 2. Setup Match
-  class ActionPlaceholder(Controller):
+  episodes_data = []
+  dt = 1.0 / 60.0
+  action_repeat = 4
 
-    def __init__(self):
-      self.action = (Vec2(0, 0), False)
+  heur_coord = TeamHeuristicCoordinator(team="blue")
+  heur_ctrl = HeuristicBotController(heur_coord)
 
-    def get_action(self, idx, sim):
-      return self.action
+  # 2. Run Evaluation Episodes
+  for ep_idx in range(num_episodes):
+    seed = base_seed + ep_idx
+    random.seed(seed)
+    np.random.seed(seed)
 
-  learner_ctrl = ActionPlaceholder()
-  if opponent_type == "heuristic":
-    opp_ctrl = HeuristicBotController(TeamHeuristicCoordinator(team="blue"))
-  else:
-    opp_ctrl = RandomOpponentController()
+    learner_ph = ActionPlaceholder()
+    opp_ph = ActionPlaceholder()
 
-  roster = [
-      PlayerSlot(
-          "red", PlayerStats("Learner", accel=3200.0), controller=learner_ctrl
-      ),
-      PlayerSlot(
-          "blue", PlayerStats("Opponent", accel=3200.0), controller=opp_ctrl
-      ),
-  ]
+    roster = [
+        PlayerSlot(
+            "red",
+            PlayerStats("Learner_Red", accel=3200.0),
+            learner_ph,
+        ),
+        PlayerSlot(
+            "blue",
+            PlayerStats("Opponent_Blue", accel=3200.0),
+            opp_ph,
+        ),
+    ]
 
-  cfg = MatchConfig(
-      mode=ClassicMatchMode(time_limit=max_steps / 60.0, score_limit=99),
-      roster=roster,
-      goal_height=goal_height,
-      pitch_width=pitch_width,
-      pitch_height=pitch_height,
-  )
-  sim = Simulation(match_config=cfg, goal_height=goal_height)
-
-  # 3. Simulate and Record State History
-  frames = []
-  goal_event = None
-
-  for step_idx in range(max_steps):
-    red_player = sim.red_team[0]
-    blue_player = sim.blue_team[0]
-
-    # Model policy inference (Deterministic)
-    obs = extract_actor_obs(sim, red_player, "red")
-    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(
-        0
+    cfg = MatchConfig(
+        mode=ClassicMatchMode(time_limit=max_steps * dt, score_limit=99),
+        roster=roster,
+        time_limit=max_steps * dt,
+        score_limit=99,
+        pitch_width=pitch_width,
+        pitch_height=pitch_height,
+        goal_height=goal_height,
     )
-    with torch.no_grad():
-      act, _, _, _ = model.get_action_and_value(obs_t, deterministic=True)
 
-    m_idx = int(act[0, 0].item())
-    kick = bool(act[0, 1].item())
-    ex, ey = ego_dirs[m_idx]
-    learner_ctrl.action = (Vec2(ex, ey), kick)
+    sim = Simulation(
+        center_x=pitch_width / 2.0,
+        center_y=pitch_height / 2.0,
+        match_config=cfg,
+        goal_height=goal_height,
+    )
 
-    # Record frame snapshot
-    if step_idx % frame_skip == 0:
+    # Disable mode's uncoordinated internal resets
+    if hasattr(sim, "mode"):
+      sim.mode.state = "PLAYING"
+      if hasattr(sim.mode, "reset_positions"):
+        sim.mode.reset_positions = lambda *args, **kwargs: None
+
+    sim.score_red = 0
+    sim.score_blue = 0
+
+    _apply_eval_restart(
+        sim,
+        ep_idx=ep_idx,
+        is_initial=True,
+        pitch_width=pitch_width,
+        pitch_height=pitch_height,
+    )
+
+    effective_goal_h = goal_height if goal_height is not None else 200.0
+    pitch_data = {
+        "width": sim.pitch.width,
+        "height": sim.pitch.height,
+        "left": sim.pitch.left,
+        "right": sim.pitch.right,
+        "top": sim.pitch.top,
+        "bottom": sim.pitch.bottom,
+        "goal_depth": getattr(sim.pitch, "goal_depth", 60.0),
+        "goal_top": sim.pitch.center.y - (effective_goal_h / 2.0),
+        "goal_bottom": sim.pitch.center.y + (effective_goal_h / 2.0),
+    }
+
+    frames = []
+
+    for step in range(max_steps):
+      # 1. Update Decisions at 15 Hz (Every 4 frames)
+      if step % action_repeat == 0:
+        # Learner
+        obs = extract_actor_obs(sim, sim.red_team[0], "red")
+        obs_t = torch.as_tensor(
+            obs, dtype=torch.float32, device=device
+        ).unsqueeze(0)
+        with torch.no_grad():
+          act, _, _, _ = model.get_action_and_value(obs_t, deterministic=True)
+        m_idx = int(act[0, 0].item())
+        ex, ey = _EGO_DIRS[m_idx]
+        learner_ph.action = (Vec2(ex, ey), bool(act[0, 1].item()))
+
+        # Opponent
+        if baseline_type == "heuristic":
+          opp_ph.action = heur_ctrl.get_action(1, sim)
+        else:
+          opp_ph.action = (
+              random.choice([Vec2(dx, dy) for dx, dy in _EGO_DIRS]),
+              random.random() < 0.20,
+          )
+
+      # 2. Advance Physics Substep
+      goal_event = sim.step(dt)
+
+      # Guarantee mode stays in PLAYING state so it never ignores goals
+      if hasattr(sim, "mode"):
+        sim.mode.state = "PLAYING"
+
+      # 3. Record Frame (Post-step so ball crossing the line is visible)
+      players_state = []
+
+      # Guarantee mode stays in PLAYING state
+      if hasattr(sim, "mode"):
+        sim.mode.state = "PLAYING"
+
+      # 4. Record Frame (Post-step so ball crossing the line is visible)
+      players_state = []
+      for player in sim.all_players:
+        players_state.append({
+            "team": player.team,
+            "name": player.stats.name,
+            "x": round(float(player.pos.x), 2),
+            "y": round(float(player.pos.y), 2),
+            "vx": round(float(player.vel.x), 2),
+            "vy": round(float(player.vel.y), 2),
+            "r": float(player.radius),
+            "is_kicking": bool(player.is_kicking),
+        })
+
+      ball_state = {
+          "x": round(float(sim.ball.pos.x), 2),
+          "y": round(float(sim.ball.pos.y), 2),
+          "vx": round(float(sim.ball.vel.x), 2),
+          "vy": round(float(sim.ball.vel.y), 2),
+          "r": float(sim.ball.radius),
+      }
+
       frames.append({
-          "step": step_idx,
-          "ball": (sim.ball.pos.x, sim.ball.pos.y),
-          "ball_radius": sim.ball.radius,
-          "red": (red_player.pos.x, red_player.pos.y),
-          "red_radius": red_player.radius,
-          "red_kick": kick,
-          "blue": (blue_player.pos.x, blue_player.pos.y),
-          "blue_radius": blue_player.radius,
-          "score": (sim.score_red, sim.score_blue),
+          "step": step,
+          "time": round(step * dt, 2),
+          "ball": ball_state,
+          "players": players_state,
+          "score_red": sim.score_red,
+          "score_blue": sim.score_blue,
+          "goal_event": goal_event,
       })
 
-    goal = sim.step(1.0 / 60.0)
-    if goal is not None:
-      goal_event = goal
-      # Append final frame
-      frames.append({
-          "step": step_idx + 1,
-          "ball": (sim.ball.pos.x, sim.ball.pos.y),
-          "ball_radius": sim.ball.radius,
-          "red": (red_player.pos.x, red_player.pos.y),
-          "red_radius": red_player.radius,
-          "red_kick": False,
-          "blue": (blue_player.pos.x, blue_player.pos.y),
-          "blue_radius": blue_player.radius,
-          "score": (sim.score_red, sim.score_blue),
-      })
-      break
+      # 5. Restart from Contested Geometry on Goal
+      if goal_event is not None:
+        _apply_eval_restart(
+            sim,
+            ep_idx=ep_idx,
+            is_initial=False,
+            pitch_width=pitch_width,
+            pitch_height=pitch_height,
+        )
 
-  print(
-      f"Simulation finished: {len(frames)} rendered frames. Result:"
-      f" {goal_event or 'Timeout (No Goal)'}"
-  )
+    episodes_data.append({
+        "episode_idx": ep_idx + 1,
+        "learner_team": "red",
+        "opponent": baseline_type,
+        "seed": seed,
+        "final_score": f"{sim.score_red} - {sim.score_blue}",
+        "frames": frames,
+    })
 
-  # 4. Render Animation using Matplotlib
-  fig, ax = plt.subplots(figsize=(10, 6.5), dpi=100)
-  ax.set_facecolor("#2e5c38")  # Pitch grass green
-  fig.patch.set_facecolor("#1a1a1a")
+  # 3. Export HTML Replay
+  html_content = _build_html_template(pitch_data, episodes_data)
+  with open(out_path, "w", encoding="utf-8") as f:
+    f.write(html_content)
 
-  p = sim.pitch
-  ax.set_xlim(p.left - 60, p.right + 60)
-  ax.set_ylim(p.bottom + 40, p.top - 40)  # Inverted Y for 2D screen coords
-  ax.set_aspect("equal")
-  ax.axis("off")
+  print(f"🎬 Replay generated successfully: {os.path.abspath(out_path)}")
+  return out_path
 
-  # Draw Static Pitch Markings
-  pitch_rect = patches.Rectangle(
-      (p.left, p.top),
-      p.width,
-      p.height,
-      linewidth=2.5,
-      edgecolor="#ffffff",
-      facecolor="none",
-  )
-  ax.add_patch(pitch_rect)
 
-  # Center line & center circle
-  ax.plot(
-      [p.center.x, p.center.x], [p.top, p.bottom], color="#ffffff", linewidth=2
-  )
-  center_circle = patches.Circle(
-      (p.center.x, p.center.y), 100.0, edgecolor="#ffffff", facecolor="none", linewidth=2
-  )
-  ax.add_patch(center_circle)
+def _build_html_template(pitch_data: dict, episodes_data: list) -> str:
+  episodes_json = json.dumps(episodes_data)
+  pitch_json = json.dumps(pitch_data)
 
-  # Goal boxes
-  left_goal = patches.Rectangle(
-      (p.left - 40, p.goal_top),
-      40,
-      p.goal_height,
-      linewidth=2,
-      edgecolor="#ffffff",
-      facecolor="#1e3d25",
-      alpha=0.6,
-  )
-  right_goal = patches.Rectangle(
-      (p.right, p.goal_top),
-      40,
-      p.goal_height,
-      linewidth=2,
-      edgecolor="#ffffff",
-      facecolor="#1e3d25",
-      alpha=0.6,
-  )
-  ax.add_patch(left_goal)
-  ax.add_patch(right_goal)
+  return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Haxball RL Replay Viewer</title>
+<style>
+  body {{
+    margin: 0;
+    padding: 20px;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }}
+  .container {{
+    max-width: 1000px;
+    width: 100%;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+  }}
+  .header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #334155;
+    padding-bottom: 12px;
+    margin-bottom: 16px;
+  }}
+  .canvas-wrapper {{
+    position: relative;
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    background: #0b1120;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    border: 1px solid #334155;
+  }}
+  canvas {{
+    display: block;
+    background: #14532d;
+  }}
+  .controls {{
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }}
+  .control-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }}
+  .btn-group {{
+    display: flex;
+    gap: 8px;
+  }}
+  button, select {{
+    background: #334155;
+    color: #f8fafc;
+    border: 1px solid #475569;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 500;
+  }}
+  button:hover, select:hover {{
+    background: #475569;
+  }}
+  button.active {{
+    background: #2563eb;
+    border-color: #3b82f6;
+  }}
+  .scrubber-container {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+  }}
+  input[type="range"] {{
+    flex: 1;
+    accent-color: #3b82f6;
+  }}
+  .telemetry {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    background: #0f172a;
+    padding: 12px;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 13px;
+    margin-top: 12px;
+  }}
+  .telemetry-item span {{
+    color: #94a3b8;
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+  }}
+</style>
+</head>
+<body>
 
-  # Dynamic Entity Artists
-  red_artist = patches.Circle(
-      (0, 0), frames[0]["red_radius"], facecolor="#e74c3c", edgecolor="#ffffff", linewidth=2
-  )
-  red_ring = patches.Circle(
-      (0, 0),
-      frames[0]["red_radius"] + 6,
-      fill=False,
-      edgecolor="#f1c40f",
-      linewidth=2.5,
-      visible=False,
-  )
-  blue_artist = patches.Circle(
-      (0, 0),
-      frames[0]["blue_radius"],
-      facecolor="#3498db",
-      edgecolor="#ffffff",
-      linewidth=2,
-  )
-  ball_artist = patches.Circle(
-      (0, 0),
-      frames[0]["ball_radius"],
-      facecolor="#ffffff",
-      edgecolor="#000000",
-      linewidth=1.5,
-  )
+<div class="container">
+  <div class="header">
+    <h2 style="margin:0;">⚡ Match Replay Visualizer</h2>
+    <div>
+      <label for="epSelect">Episode: </label>
+      <select id="epSelect"></select>
+    </div>
+  </div>
 
-  ax.add_patch(red_ring)
-  ax.add_patch(red_artist)
-  ax.add_patch(blue_artist)
-  ax.add_patch(ball_artist)
+  <div class="canvas-wrapper">
+    <canvas id="pitchCanvas" width="900" height="550"></canvas>
+  </div>
 
-  title_text = ax.text(
-      p.center.x,
-      p.top - 18,
-      "",
-      ha="center",
-      va="center",
-      color="#ffffff",
-      fontsize=13,
-      fontweight="bold",
-  )
+  <div class="controls">
+    <div class="scrubber-container">
+      <span id="timeDisplay" style="font-family: monospace; min-width: 60px;">0.00s</span>
+      <input type="range" id="scrubber" min="0" max="0" value="0">
+      <span id="frameDisplay" style="font-family: monospace; min-width: 80px;">0 / 0</span>
+    </div>
 
-  def update(frame_data):
-    # Update positions
-    rx, ry = frame_data["red"]
-    red_artist.center = (rx, ry)
-    red_ring.center = (rx, ry)
-    red_ring.set_visible(frame_data["red_kick"])  # Glow ring when agent kicks
+    <div class="control-row">
+      <div class="btn-group">
+        <button id="btnPlay">▶ Play</button>
+        <button id="btnPrev">|◀ Step</button>
+        <button id="btnNext">Step ▶|</button>
+        <button id="btnReset">↺ Reset</button>
+      </div>
 
-    bx, by = frame_data["blue"]
-    blue_artist.center = (bx, by)
+      <div class="btn-group">
+        <label style="align-self:center; font-size:14px;">Speed: </label>
+        <button class="btnSpeed" data-speed="0.25">0.25x</button>
+        <button class="btnSpeed active" data-speed="1.0">1.0x</button>
+        <button class="btnSpeed" data-speed="2.0">2.0x</button>
+        <button class="btnSpeed" data-speed="4.0">4.0x</button>
+      </div>
+    </div>
+  </div>
 
-    ball_x, ball_y = frame_data["ball"]
-    ball_artist.center = (ball_x, ball_y)
+  <div class="telemetry">
+    <div class="telemetry-item">
+      <span>Score</span>
+      <strong id="telScore" style="color: #f59e0b; font-size: 16px;">0 - 0</strong>
+    </div>
+    <div class="telemetry-item">
+      <span>Matchup</span>
+      <strong id="telMatchup">-</strong>
+    </div>
+    <div class="telemetry-item">
+      <span>Ball Velocity</span>
+      <strong id="telBallVel">0.0 px/s</strong>
+    </div>
+    <div class="telemetry-item">
+      <span>Active Kicking</span>
+      <strong id="telKickState">None</strong>
+    </div>
+  </div>
+</div>
 
-    sec = frame_data["step"] / 60.0
-    r_score, b_score = frame_data["score"]
-    title_text.set_text(
-        f"Step: {frame_data['step']:03d} ({sec:4.1f}s) | Score: [RED {r_score} -"
-        f" {b_score} BLUE]"
-    )
-    return red_artist, red_ring, blue_artist, ball_artist, title_text
+<script>
+const pitch = {pitch_json};
+const episodes = {episodes_json};
 
-  ani = animation.FuncAnimation(
-      fig, update, frames=frames, interval=1000 / (60 / frame_skip), blit=True
-  )
-  plt.close(fig)
+let currentEpIdx = 0;
+let currentFrameIdx = 0;
+let isPlaying = false;
+let playbackSpeed = 1.0;
+let lastAnimTime = 0;
+let frameAccumulator = 0;
 
-  if save_path:
-    if save_path.endswith(".gif"):
-      ani.save(save_path, writer="pillow", fps=int(60 / frame_skip))
-    else:
-      ani.save(save_path, writer="ffmpeg", fps=int(60 / frame_skip))
-    print(f"🎬 Video saved to: {save_path}")
+const canvas = document.getElementById("pitchCanvas");
+const ctx = canvas.getContext("2d");
 
-  return HTML(ani.to_jshtml())
+const epSelect = document.getElementById("epSelect");
+const scrubber = document.getElementById("scrubber");
+const btnPlay = document.getElementById("btnPlay");
+const btnPrev = document.getElementById("btnPrev");
+const btnNext = document.getElementById("btnNext");
+const btnReset = document.getElementById("btnReset");
+const timeDisplay = document.getElementById("timeDisplay");
+const frameDisplay = document.getElementById("frameDisplay");
+
+const telScore = document.getElementById("telScore");
+const telMatchup = document.getElementById("telMatchup");
+const telBallVel = document.getElementById("telBallVel");
+const telKickState = document.getElementById("telKickState");
+
+episodes.forEach((ep, idx) => {{
+  const opt = document.createElement("option");
+  opt.value = idx;
+  opt.textContent = `Match ${{ep.episode_idx}}: Learner vs ${{ep.opponent.toUpperCase()}} (${{ep.final_score}})`;
+  epSelect.appendChild(opt);
+}});
+
+epSelect.addEventListener("change", (e) => {{
+  loadEpisode(parseInt(e.target.value));
+}});
+
+function loadEpisode(idx) {{
+  currentEpIdx = idx;
+  currentFrameIdx = 0;
+  const ep = episodes[currentEpIdx];
+  scrubber.max = Math.max(0, ep.frames.length - 1);
+  scrubber.value = 0;
+  telMatchup.innerHTML = `<span style="color:#ef4444">Learner (Red)</span> vs <span style="color:#3b82f6">${{ep.opponent.toUpperCase()}} (Blue)</span>`;
+  renderFrame();
+}}
+
+scrubber.addEventListener("input", (e) => {{
+  currentFrameIdx = parseInt(e.target.value);
+  renderFrame();
+}});
+
+btnPlay.addEventListener("click", () => {{
+  isPlaying = !isPlaying;
+  btnPlay.textContent = isPlaying ? "⏸ Pause" : "▶ Play";
+  btnPlay.classList.toggle("active", isPlaying);
+  if (isPlaying) {{
+    lastAnimTime = performance.now();
+    requestAnimationFrame(animationLoop);
+  }}
+}});
+
+btnPrev.addEventListener("click", () => {{
+  if (currentFrameIdx > 0) {{
+    currentFrameIdx--;
+    scrubber.value = currentFrameIdx;
+    renderFrame();
+  }}
+}});
+
+btnNext.addEventListener("click", () => {{
+  const ep = episodes[currentEpIdx];
+  if (currentFrameIdx < ep.frames.length - 1) {{
+    currentFrameIdx++;
+    scrubber.value = currentFrameIdx;
+    renderFrame();
+  }}
+}});
+
+btnReset.addEventListener("click", () => {{
+  currentFrameIdx = 0;
+  scrubber.value = 0;
+  renderFrame();
+}});
+
+document.querySelectorAll(".btnSpeed").forEach(btn => {{
+  btn.addEventListener("click", (e) => {{
+    document.querySelectorAll(".btnSpeed").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    playbackSpeed = parseFloat(btn.dataset.speed);
+  }});
+}});
+
+function animationLoop(timestamp) {{
+  if (!isPlaying) return;
+
+  const dt = (timestamp - lastAnimTime) / 1000.0;
+  lastAnimTime = timestamp;
+
+  frameAccumulator += dt * 60.0 * playbackSpeed;
+  const ep = episodes[currentEpIdx];
+
+  while (frameAccumulator >= 1.0) {{
+    if (currentFrameIdx < ep.frames.length - 1) {{
+      currentFrameIdx++;
+    }} else {{
+      isPlaying = false;
+      btnPlay.textContent = "▶ Play";
+      btnPlay.classList.remove("active");
+      break;
+    }}
+    frameAccumulator -= 1.0;
+  }}
+
+  scrubber.value = currentFrameIdx;
+  renderFrame();
+
+  if (isPlaying) {{
+    requestAnimationFrame(animationLoop);
+  }}
+}}
+
+function renderFrame() {{
+  const ep = episodes[currentEpIdx];
+  if (!ep || !ep.frames || ep.frames.length === 0) return;
+  const frame = ep.frames[currentFrameIdx];
+  if (!frame) return;
+
+  timeDisplay.textContent = frame.time.toFixed(2) + "s";
+  frameDisplay.textContent = `${{frame.step}} / ${{ep.frames.length - 1}}`;
+  telScore.textContent = `${{frame.score_red}} - ${{frame.score_blue}}`;
+
+  const ballSpeed = Math.hypot(frame.ball.vx, frame.ball.vy);
+  telBallVel.textContent = ballSpeed.toFixed(1) + " px/s";
+
+  const kickingPlayers = frame.players.filter(p => p.is_kicking);
+  if (kickingPlayers.length > 0) {{
+    telKickState.textContent = kickingPlayers.map(p => p.name).join(", ");
+    telKickState.style.color = "#fbbf24";
+  }} else {{
+    telKickState.textContent = "None";
+    telKickState.style.color = "#94a3b8";
+  }}
+
+  const margin = 40;
+  const scaleX = (canvas.width - margin * 2) / (pitch.right - pitch.left);
+  const scaleY = (canvas.height - margin * 2) / (pitch.bottom - pitch.top);
+  const scale = Math.min(scaleX, scaleY);
+
+  const toScreenX = (x) => margin + (x - pitch.left) * scale;
+  const toScreenY = (y) => margin + (y - pitch.top) * scale;
+
+  ctx.fillStyle = "#15803d";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
+  ctx.lineWidth = 3;
+
+  const left = toScreenX(pitch.left);
+  const right = toScreenX(pitch.right);
+  const top = toScreenY(pitch.top);
+  const bottom = toScreenY(pitch.bottom);
+  const centerX = (left + right) / 2;
+  const centerY = (top + bottom) / 2;
+
+  ctx.strokeRect(left, top, right - left, bottom - top);
+
+  ctx.beginPath();
+  ctx.moveTo(centerX, top);
+  ctx.lineTo(centerX, bottom);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 70 * scale, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const goalTop = toScreenY(pitch.goal_top);
+  const goalBottom = toScreenY(pitch.goal_bottom);
+  const goalWidth = 25 * scale;
+
+  ctx.fillStyle = "rgba(255, 255, 255, 0.15)";
+  ctx.fillRect(left - goalWidth, goalTop, goalWidth, goalBottom - goalTop);
+  ctx.strokeRect(left - goalWidth, goalTop, goalWidth, goalBottom - goalTop);
+
+  ctx.fillRect(right, goalTop, goalWidth, goalBottom - goalTop);
+  ctx.strokeRect(right, goalTop, goalWidth, goalBottom - goalTop);
+
+  frame.players.forEach(p => {{
+    const px = toScreenX(p.x);
+    const py = toScreenY(p.y);
+    const pr = p.r * scale;
+
+    if (p.is_kicking) {{
+      ctx.beginPath();
+      ctx.arc(px, py, pr + 6, 0, Math.PI * 2);
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }}
+
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fillStyle = p.team === "red" ? "#dc2626" : "#2563eb";
+    ctx.fill();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    if (Math.hypot(p.vx, p.vy) > 10) {{
+      const headingAngle = Math.atan2(p.vy, p.vx);
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(px + Math.cos(headingAngle) * pr * 1.5, py + Math.sin(headingAngle) * pr * 1.5);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }}
+  }});
+
+  const bx = toScreenX(frame.ball.x);
+  const by = toScreenY(frame.ball.y);
+  const br = frame.ball.r * scale;
+
+  ctx.beginPath();
+  ctx.arc(bx + 2, by + 3, br, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.35)";
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(bx, by, br, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  if (frame.goal_event) {{
+    ctx.fillStyle = "rgba(251, 191, 36, 0.4)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "bold 36px sans-serif";
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.fillText("⚽ GOAL!", canvas.width / 2, 70);
+  }}
+}}
+
+if (episodes && episodes.length > 0) {{
+  loadEpisode(0);
+}}
+</script>
+</body>
+</html>
+"""

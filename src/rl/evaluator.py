@@ -13,6 +13,8 @@ from src.rl.benchmarker import RLController
 from src.rl.env_wrapper import RandomController, MultiAgentRLController
 from src.rl.ppo_core import ActorCritic
 from src.rl.reset_strategies import RandomReset
+from src.rl_2.model import ActorCritic
+from src.rl_2.obs import ACTOR_OBS_DIM, extract_actor_obs
 
 
 def _resolve_agent_controller(
@@ -51,170 +53,6 @@ def _resolve_agent_controller(
     else:
         raise TypeError(f"Unsupported agent type: {type(agent)}")
     
-def evaluate_and_generate_html_2(
-    red_agent: str | nn.Module | Controller,
-    blue_agent: str | nn.Module | Controller = "heuristic",
-    team_size: int = 2,
-    red_team_size: int | None = None,
-    blue_team_size: int | None = None,
-    output_dir: str = "render/",
-    filename: str = "match_replay.html",
-    num_episodes: int = 3,
-    max_steps: int = 1800,
-    time_limit: float = 30.0,
-    base_seed: int = 70000,
-    swap_sides: bool = False,
-    device: torch.device = torch.device("cpu"),
-) -> str:
-    """Simulates matches between any combination of agents (RL, Heuristic, Random)
-
-    across arbitrary team sizes (1v1, 2v2, 3v3) and generates an HTML5 replay.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, filename)
-
-    n_red = red_team_size if red_team_size is not None else team_size
-    n_blue = blue_team_size if blue_team_size is not None else team_size
-
-    reset_strat = RandomReset()
-    episodes_data = []
-    pitch_data = None
-    dt = 1.0 / 60.0
-
-    for ep_idx in range(num_episodes):
-        # Determine team assignments
-        is_swapped = swap_sides and (ep_idx % 2 == 1)
-        active_red_agent = blue_agent if is_swapped else red_agent
-        active_blue_agent = red_agent if is_swapped else blue_agent
-
-        ctrl_red, label_red = _resolve_agent_controller(active_red_agent, team="red", device=device)
-        ctrl_blue, label_blue = _resolve_agent_controller(active_blue_agent, team="blue", device=device)
-
-        # Build dynamic multi-agent roster
-        roster = []
-        for i in range(n_red):
-            roster.append(
-                PlayerSlot(
-                    "red",
-                    PlayerStats(name=f"{label_red}_{i + 1}", accel=3200.0),
-                    ctrl_red,
-                )
-            )
-        for i in range(n_blue):
-            roster.append(
-                PlayerSlot(
-                    "blue",
-                    PlayerStats(name=f"{label_blue}_{i + 1}", accel=3200.0),
-                    ctrl_blue,
-                )
-            )
-
-        cfg = MatchConfig(
-            mode=ClassicMatchMode(time_limit=time_limit, score_limit=99),
-            roster=roster,
-            time_limit=time_limit,
-            score_limit=99,
-        )
-
-        pw = getattr(cfg, "pitch_width", 840.0)
-        ph = getattr(cfg, "pitch_height", 480.0)
-        sim = Simulation(match_config=cfg, center_x=pw / 2.0, center_y=ph / 2.0)
-
-        seed = base_seed + ep_idx
-        reset_strat.set_seed(seed)
-        reset_strat.reset(sim)
-
-        # Cache geometry avoiding center_y pitch attribute issues
-        if pitch_data is None:
-            p = sim.pitch
-            center_y = getattr(sim, "center", Vec2(pw / 2.0, ph / 2.0)).y
-            goal_top = getattr(p, "goal_top", center_y - 80.0)
-            goal_bottom = getattr(p, "goal_bottom", center_y + 80.0)
-
-            pitch_data = {
-                "width": p.width,
-                "height": p.height,
-                "left": p.left,
-                "right": p.right,
-                "top": p.top,
-                "bottom": p.bottom,
-                "goal_depth": getattr(p, "goal_depth", 60.0),
-                "goal_top": goal_top,
-                "goal_bottom": goal_bottom,
-            }
-
-        frames = []
-        score_red = 0
-        score_blue = 0
-
-        for step in range(max_steps):
-            players_state = []
-            for player in sim.all_players:
-                players_state.append(
-                    {
-                        "team": player.team,
-                        "name": player.stats.name,
-                        "x": round(float(player.pos.x), 2),
-                        "y": round(float(player.pos.y), 2),
-                        "vx": round(float(player.vel.x), 2),
-                        "vy": round(float(player.vel.y), 2),
-                        "r": float(player.radius),
-                        "is_kicking": bool(player.is_kicking),
-                    }
-                )
-
-            ball_state = {
-                "x": round(float(sim.ball.pos.x), 2),
-                "y": round(float(sim.ball.pos.y), 2),
-                "vx": round(float(sim.ball.vel.x), 2),
-                "vy": round(float(sim.ball.vel.y), 2),
-                "r": float(sim.ball.radius),
-            }
-
-            goal_event = sim.step(dt)
-
-            if goal_event == "red_goal":
-                score_red += 1
-            elif goal_event == "blue_goal":
-                score_blue += 1
-
-            frames.append(
-                {
-                    "step": step,
-                    "time": round(step * dt, 2),
-                    "ball": ball_state,
-                    "players": players_state,
-                    "score_red": score_red,
-                    "score_blue": score_blue,
-                    "goal_event": goal_event,
-                }
-            )
-
-            if goal_event is not None:
-                reset_strat.reset(sim)
-
-        learner_team = "blue" if is_swapped else "red"
-
-        episodes_data.append(
-            {
-                "episode_idx": ep_idx + 1,
-                "learner_team": learner_team,
-                "red_agent": label_red,
-                "blue_agent": label_blue,
-                "seed": seed,
-                "final_score": f"{score_red} - {score_blue}",
-                "frames": frames,
-            }
-        )
-
-    from src.rl.evaluator import _build_html_template
-    html_content = _build_html_template(pitch_data, episodes_data)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    print(f"🎬 Multi-Agent Replay generated: {os.path.abspath(out_path)}")
-    return out_path
-
 
 def evaluate_and_generate_html(
     model_or_path: str | nn.Module,
@@ -232,12 +70,18 @@ def evaluate_and_generate_html(
 
     # 1. Load Model
     if isinstance(model_or_path, str):
-        model = ActorCritic(obs_dim=80).to(device)
-        model.load_state_dict(
-            torch.load(model_or_path, map_location=device, weights_only=False)
-        )
+      # Uses the correct 64-dim default from src.rl_2.model
+      model = ActorCritic().to(device)
+      ckpt = torch.load(model_or_path, map_location=device, weights_only=False)
+      state_dict = (
+          ckpt["model_state_dict"]
+          if isinstance(ckpt, dict) and "model_state_dict" in ckpt
+          else ckpt
+      )
+      model.load_state_dict(state_dict)
     else:
-        model = model_or_path.to(device)
+      model = model_or_path.to(device)
+      
     model.eval()
 
     reset_strat = RandomReset()
