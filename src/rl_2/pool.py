@@ -327,10 +327,10 @@ class SelfPlayPool:
 
       physics_steps = 0
       ep_rew = 0.0
-      action_repeat = 4
+      action_repeat = 10
 
       while physics_steps < max_steps:
-        # 1. Update Learner Actions (15 Hz)
+        # 1. Update Learner Actions 
         l_squad = sim.red_team if learner_team == "red" else sim.blue_team
         for idx, player in enumerate(l_squad):
           obs = extract_actor_obs(sim, player, learner_team)
