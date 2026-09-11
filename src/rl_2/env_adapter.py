@@ -319,16 +319,136 @@ class MatchEnv(gym.Env):
 
 
   def _apply_squad_positions(self, rx: float, ry: float, bx: float, by: float):
-    """Helper to cleanly position squads and clear lingering velocities."""
-    for idx, pl in enumerate(self.sim.red_team):
-      pl.pos = Vec2(rx, ry + (idx * 45.0))
-      pl.vel = Vec2(0.0, 0.0)
-      pl.kick_cooldown_timer = 0.0
+    """Universal NvN squad placer with point-symmetric randomization.
 
-    for idx, pl in enumerate(self.sim.blue_team):
-      pl.pos = Vec2(bx, by - (idx * 45.0))
-      pl.vel = Vec2(0.0, 0.0)
-      pl.kick_cooldown_timer = 0.0
+    Supports 1v1, 2v2, 3v3, etc. without hand-crafted roles or formation bias.
+    """
+    p = self.sim.pitch
+    ball = self.sim.ball
+    center = self.sim.center
+
+    safe_m = 48.0
+    min_player_dist = 52.0  # Prevents disc-overlap collisions (radius ~15px)
+    min_ball_dist = 36.0  # Prevents spawning inside the ball (radius ~10px)
+
+    # 1. Place Primary Duelists (Index 0)
+    self.sim.red_team[0].pos = Vec2(rx, ry)
+    self.sim.red_team[0].vel = Vec2(0.0, 0.0)
+    self.sim.red_team[0].kick_cooldown_timer = 0.0
+
+    self.sim.blue_team[0].pos = Vec2(bx, by)
+    self.sim.blue_team[0].vel = Vec2(0.0, 0.0)
+    self.sim.blue_team[0].kick_cooldown_timer = 0.0
+
+    placed_red = [self.sim.red_team[0].pos]
+    placed_blue = [self.sim.blue_team[0].pos]
+
+    team_size = len(self.sim.red_team)
+    if team_size <= 1:
+      return
+
+    # 2. Randomly Place Additional Teammates (Indices 1 .. N-1) with Strict Fairness
+    for idx in range(1, team_size):
+      placed = False
+
+      for _ in range(60):
+        # 50% Ball-Symmetric (equal distance to ball), 50% Pitch-Symmetric (equal goal/pitch coverage)
+        if random.random() < 0.50:
+          # Ball-Centric: random radial offset from ball in any direction
+          dist = random.uniform(70.0, min(520.0, p.width * 0.45))
+          angle = random.uniform(-math.pi, math.pi)
+          vx = dist * math.cos(angle)
+          vy = dist * math.sin(angle)
+
+          r_pos = Vec2(ball.pos.x - vx, ball.pos.y - vy)
+          b_pos = Vec2(ball.pos.x + vx, ball.pos.y + vy)
+        else:
+          # Pitch-Centric: point reflection across field center (2*C - P)
+          rx_cand = random.uniform(
+              p.left + safe_m, center.x + (p.width * 0.15)
+          )
+          ry_cand = random.uniform(p.top + safe_m, p.bottom - safe_m)
+
+          r_pos = Vec2(rx_cand, ry_cand)
+          b_pos = Vec2(2.0 * center.x - rx_cand, 2.0 * center.y - ry_cand)
+
+        # A. Pitch Boundary Checks
+        if not (
+            p.left + safe_m <= r_pos.x <= p.right - safe_m
+            and p.top + safe_m <= r_pos.y <= p.bottom - safe_m
+            and p.left + safe_m <= b_pos.x <= p.right - safe_m
+            and p.top + safe_m <= b_pos.y <= p.bottom - safe_m
+        ):
+          continue
+
+        # B. Ball Clearance Checks
+        if (
+            r_pos.distance_to(ball.pos) < min_ball_dist
+            or b_pos.distance_to(ball.pos) < min_ball_dist
+        ):
+          continue
+
+        # C. Inter-Player Collision Checks
+        collision = False
+        for existing in placed_red + placed_blue:
+          if (
+              r_pos.distance_to(existing) < min_player_dist
+              or b_pos.distance_to(existing) < min_player_dist
+          ):
+            collision = True
+            break
+
+        if r_pos.distance_to(b_pos) < min_player_dist:
+          collision = True
+
+        if collision:
+          continue
+
+        # Valid non-overlapping symmetric spawn found
+        self.sim.red_team[idx].pos = r_pos
+        self.sim.red_team[idx].vel = Vec2(0.0, 0.0)
+        self.sim.red_team[idx].kick_cooldown_timer = 0.0
+
+        self.sim.blue_team[idx].pos = b_pos
+        self.sim.blue_team[idx].vel = Vec2(0.0, 0.0)
+        self.sim.blue_team[idx].kick_cooldown_timer = 0.0
+
+        placed_red.append(r_pos)
+        placed_blue.append(b_pos)
+        placed = True
+        break
+
+      # Deterministic fallback if random sampling gets crowded
+      if not placed:
+        fallback_offset = 130.0 * idx
+        fallback_r = Vec2(
+            max(p.left + safe_m, rx - fallback_offset),
+            min(
+                p.bottom - safe_m,
+                max(p.top + safe_m, ry + (70.0 if idx % 2 == 1 else -70.0)),
+            ),
+        )
+        fallback_b = Vec2(
+            min(p.right - safe_m, bx + fallback_offset),
+            min(
+                p.bottom - safe_m,
+                max(p.top + safe_m, by - (70.0 if idx % 2 == 1 else -70.0)),
+            ),
+        )
+
+        self.sim.red_team[idx].pos = fallback_r
+        self.sim.red_team[idx].vel = Vec2(0.0, 0.0)
+        self.sim.red_team[idx].kick_cooldown_timer = 0.0
+
+        self.sim.blue_team[idx].pos = fallback_b
+        self.sim.blue_team[idx].vel = Vec2(0.0, 0.0)
+        self.sim.blue_team[idx].kick_cooldown_timer = 0.0
+
+        placed_red.append(fallback_r)
+        placed_blue.append(fallback_b)
+
+
+
 
   def _get_obs_payload(self) -> dict[str, np.ndarray]:
     team_squad = (
@@ -345,6 +465,8 @@ class MatchEnv(gym.Env):
     if self.team_size == 1:
       return {"obs": obs_list[0], "state": state}
     return {"obs": np.array(obs_list, dtype=np.float32), "state": state}
+
+
 
   def reset(self, seed: int | None = None, options: dict | None = None):
     super().reset(seed=seed)

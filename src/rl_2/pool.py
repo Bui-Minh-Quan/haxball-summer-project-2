@@ -207,45 +207,71 @@ class SelfPlayPool:
 
     def apply_eval_restart(sim, ep_idx: int, is_initial: bool = False):
       p = sim.pitch
+      safe_m = 50.0
+
+      # 1. Determine Ball & Lead Duelist Coordinates
       if (ep_idx % 5 == 0) and is_initial:
-        # Standard center kickoff
-        sim.ball.pos = Vec2(sim.center.x, sim.center.y)
-        sim.ball.vel = Vec2(0.0, 0.0)
-        sim.red_team[0].pos = Vec2(sim.center.x - 120.0, sim.center.y)
-        sim.red_team[0].vel = Vec2(0.0, 0.0)
-        sim.blue_team[0].pos = Vec2(sim.center.x + 120.0, sim.center.y)
-        sim.blue_team[0].vel = Vec2(0.0, 0.0)
+        bx, by = sim.center.x, sim.center.y
+        dist = min(140.0, p.width * 0.16)
+        angle = 0.0
       else:
-        sweep_idx = (
+        sweep = (
             ep_idx
             if is_initial
             else (ep_idx + int(sim.score_red + sim.score_blue) * 7)
         )
+        dist = min(220.0, p.width * 0.25) * (0.70 + (sweep % 4) * 0.08)
+        angle = -math.pi / 4 + ((sweep * 31.0) % 90.0) * (math.pi / 180.0)
+        bx = sim.center.x + (((sweep % 3) - 1) * (p.width * 0.12))
+        by = sim.center.y + ((((sweep // 3) % 3) - 1) * (p.height * 0.14))
 
-        # Scale offsets dynamically to pitch dimensions (prevents net clipping)
-        max_dist = min(180.0, p.width * 0.22)
-        dist = max_dist * (0.75 + (sweep_idx % 4) * 0.08)
+      sim.ball.pos = Vec2(bx, by)
+      sim.ball.vel = Vec2(0.0, 0.0)
 
-        # Forward angles only (-45° to +45°) so Red is strictly to the left of the ball
-        angle = -math.pi / 4 + ((sweep_idx * 31.0) % 90.0) * (math.pi / 180.0)
+      vx, vy = dist * math.cos(angle), dist * math.sin(angle)
+      rx_lead, ry_lead = bx - vx, by - vy
+      bx_lead, by_lead = bx + vx, by + vy
 
-        # Keep ball within central 40% of pitch
-        bx = sim.center.x + (((sweep_idx % 3) - 1) * (p.width * 0.12))
-        by = sim.center.y + ((((sweep_idx // 3) % 3) - 1) * (p.height * 0.15))
+      # 2. Position All Red Players with Tactical Staggering
+      for idx, pl in enumerate(sim.red_team):
+        if idx == 0:
+          px = max(p.left + safe_m, min(p.right - safe_m, rx_lead))
+          py = max(p.top + safe_m, min(p.bottom - safe_m, ry_lead))
+        else:
+          back_offset = min(240.0, max(120.0, (rx_lead - p.left) * 0.45))
+          px = max(p.left + safe_m, rx_lead - back_offset)
+          lane_sign = 1.0 if (idx % 2 == 1) else -1.0
+          py = min(
+              max(p.top + safe_m, sim.center.y + (lane_sign * 90.0)),
+              p.bottom - safe_m,
+          )
+        pl.pos = Vec2(px, py)
+        pl.vel = Vec2(0.0, 0.0)
+        pl.kick_cooldown_timer = 0.0
 
-        sim.ball.pos = Vec2(bx, by)
-        sim.ball.vel = Vec2(0.0, 0.0)
+      # 3. Position All Blue Players with Tactical Staggering
+      for idx, pl in enumerate(sim.blue_team):
+        if idx == 0:
+          px = max(p.left + safe_m, min(p.right - safe_m, bx_lead))
+          py = max(p.top + safe_m, min(p.bottom - safe_m, by_lead))
+        else:
+          back_offset = min(240.0, max(120.0, (p.right - bx_lead) * 0.45))
+          px = min(p.right - safe_m, bx_lead + back_offset)
+          lane_sign = -1.0 if (idx % 2 == 1) else 1.0
+          py = min(
+              max(p.top + safe_m, sim.center.y + (lane_sign * 90.0)),
+              p.bottom - safe_m,
+          )
+        pl.pos = Vec2(px, py)
+        pl.vel = Vec2(0.0, 0.0)
+        pl.kick_cooldown_timer = 0.0
 
-        vx = dist * math.cos(angle)
-        vy = dist * math.sin(angle)
+      # 4. Neutralize Match Mode State
+      if hasattr(sim, "mode"):
+        sim.mode.state = "PLAYING"
+        if hasattr(sim.mode, "celebration_timer"):
+          sim.mode.celebration_timer = 0.0
 
-        sim.red_team[0].pos = Vec2(bx - vx, by - vy)
-        sim.red_team[0].vel = Vec2(0.0, 0.0)
-        sim.red_team[0].kick_cooldown_timer = 0.0
-
-        sim.blue_team[0].pos = Vec2(bx + vx, by + vy)
-        sim.blue_team[0].vel = Vec2(0.0, 0.0)
-        sim.blue_team[0].kick_cooldown_timer = 0.0
 
     for ep in range(num_episodes):
       learner_team = "red" if ep % 2 == 0 else "blue"
@@ -282,6 +308,15 @@ class SelfPlayPool:
       )
       sim = Simulation(match_config=cfg, goal_height=goal_height)
 
+      # ── DISABLE INTERNAL MODE RESETS ──
+      if hasattr(sim, "mode"):
+        sim.mode.state = "PLAYING"
+        if hasattr(sim.mode, "reset_positions"):
+          sim.mode.reset_positions = lambda *args, **kwargs: None
+
+      sim.score_red = 0
+      sim.score_blue = 0
+
       apply_eval_restart(sim, ep_idx=ep, is_initial=True)
 
       physics_steps = 0
@@ -311,9 +346,13 @@ class SelfPlayPool:
         # 2. Update Opponent Action (15 Hz)
         o_squad = sim.blue_team if learner_team == "red" else sim.red_team
         for idx, opp_player in enumerate(o_squad):
+          # Query using true global index in sim.all_players
+          global_idx = sim.all_players.index(opp_player)
+
           if opponent_type == "heuristic":
             bot = heur_ctrl_blue if opp_team == "blue" else heur_ctrl_red
-            opp_placeholders[idx].action = bot.get_action(idx, sim)
+            opp_placeholders[idx].action = bot.get_action(global_idx, sim)
+
           elif opponent_type == "model" and opponent_model:
             obs = extract_actor_obs(sim, opp_player, opp_team)
             obs_t = torch.as_tensor(
@@ -329,6 +368,7 @@ class SelfPlayPool:
                 Vec2(ex * -sign, ey),
                 bool(act[0, 1].item()),
             )
+
           else:
             opp_placeholders[idx].action = (
                 random.choice([Vec2(dx, dy) for dx, dy in _ego_dirs]),
@@ -339,6 +379,9 @@ class SelfPlayPool:
         for _ in range(action_repeat):
           physics_steps += 1
           goal = sim.step(1.0 / 60.0)
+
+          if hasattr(sim, "mode"):
+            sim.mode.state = "PLAYING"
 
           if goal is not None:
             scored = goal == f"{learner_team}_goal"
@@ -362,7 +405,7 @@ class SelfPlayPool:
         ep_rew -= 1.0 + 0.1 * abs(diff)
         losses += 1
       else:
-        ep_rew -= 0.5
+        ep_rew -= 1.0
         draws += 1
 
       total_scored += scored

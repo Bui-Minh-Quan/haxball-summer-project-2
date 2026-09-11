@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +14,7 @@ from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
 from src.rl_2.model import ActorCritic
-from src.rl_2.obs import ACTOR_OBS_DIM, extract_actor_obs
+from src.rl_2.obs import extract_actor_obs
 
 _EGO_DIRS = [
     (0.0, 0.0),  # 0: None
@@ -29,7 +30,7 @@ _EGO_DIRS = [
 
 
 class ActionPlaceholder(Controller):
-  """Holds discrete actions across 4 physics substeps to match training (15 Hz)."""
+  """Holds discrete actions across 4 physics substeps to synchronize with 15 Hz training."""
 
   def __init__(self):
     self.action = (Vec2(0.0, 0.0), False)
@@ -38,125 +39,202 @@ class ActionPlaceholder(Controller):
     return self.action
 
 
-def _apply_eval_restart(
+def _resolve_agent(
+    agent_spec: str | nn.Module,
+    team: str,
+    device: torch.device,
+) -> tuple[str, Any, str]:
+  """Parses agent input into a standardized executable handler and display label."""
+  sign = 1.0 if team == "red" else -1.0
+
+  if isinstance(agent_spec, str):
+    spec_lower = agent_spec.lower().strip()
+    if spec_lower == "heuristic":
+      coord = TeamHeuristicCoordinator(team=team)
+      ctrl = HeuristicBotController(coord)
+      return "heuristic", ctrl, f"Heuristic_{team.capitalize()}"
+    elif spec_lower == "random":
+      return "random", None, f"Random_{team.capitalize()}"
+    elif os.path.exists(agent_spec) or agent_spec.endswith(".pt"):
+      model = ActorCritic().to(device)
+      ckpt = torch.load(agent_spec, map_location=device, weights_only=False)
+      state_dict = (
+          ckpt["model_state_dict"]
+          if isinstance(ckpt, dict) and "model_state_dict" in ckpt
+          else ckpt
+      )
+      model.load_state_dict(state_dict, strict=False)
+      model.eval()
+      label = os.path.splitext(os.path.basename(agent_spec))[0]
+      return "model", model, label
+    else:
+      raise ValueError(f"Unrecognized agent specification: '{agent_spec}'")
+
+  elif isinstance(agent_spec, nn.Module):
+    agent_spec.eval()
+    return "model", agent_spec, f"RL_{team.capitalize()}"
+  else:
+    raise TypeError(f"Unsupported agent type: {type(agent_spec)}")
+
+
+def _query_agent_action(
+    agent_type: str,
+    handler: Any,
+    team: str,
+    player_idx: int,
+    player_obj: Any,
+    sim: Simulation,
+    device: torch.device,
+) -> tuple[Vec2, bool]:
+  """Generates action tuple (Vec2, kick) for a specific player disc."""
+  sign = 1.0 if team == "red" else -1.0
+
+  if agent_type == "heuristic":
+    return handler.get_action(player_idx, sim)
+
+  elif agent_type == "random":
+    m_idx = random.randint(0, 8)
+    dx, dy = _EGO_DIRS[m_idx]
+    return Vec2(dx, dy), random.random() < 0.20
+
+  elif agent_type == "model":
+    obs = extract_actor_obs(sim, player_obj, team)
+    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(
+        0
+    )
+    with torch.no_grad():
+      act, _, _, _ = handler.get_action_and_value(obs_t, deterministic=True)
+    m_idx = int(act[0, 0].item())
+    ex, ey = _EGO_DIRS[m_idx]
+    return Vec2(ex * sign, ey), bool(act[0, 1].item())
+
+  return Vec2(0.0, 0.0), False
+
+
+def _apply_general_restart(
     sim: Simulation,
     ep_idx: int,
     is_initial: bool = False,
     pitch_width: float = 1200.0,
     pitch_height: float = 800.0,
 ):
-  """Deterministic point-symmetric spatial gauntlet across episodes."""
+  """Point-symmetric restart supporting arbitrary squad sizes and multi-lane staggering."""
   p = sim.pitch
+  safe_m = 50.0
 
-  # 20% Canonical center kickoff on match start; 80% point-symmetric gauntlet
+  # 1. Kickoff or Midfield Point Contest
   if (ep_idx % 5 == 0) and is_initial:
-    sim.ball.pos = Vec2(sim.center.x, sim.center.y)
-    sim.ball.vel = Vec2(0.0, 0.0)
-    sim.red_team[0].pos = Vec2(sim.center.x - 140.0, sim.center.y)
-    sim.red_team[0].vel = Vec2(0.0, 0.0)
-    sim.red_team[0].kick_cooldown_timer = 0.0
-
-    sim.blue_team[0].pos = Vec2(sim.center.x + 140.0, sim.center.y)
-    sim.blue_team[0].vel = Vec2(0.0, 0.0)
-    sim.blue_team[0].kick_cooldown_timer = 0.0
+    bx, by = sim.center.x, sim.center.y
+    dist = min(140.0, pitch_width * 0.16)
+    angle = 0.0
   else:
-    # Deterministic spatial parameter sweep across quadrants and wings
-    sweep_idx = (
+    sweep = (
         ep_idx
         if is_initial
         else (ep_idx + int(sim.score_red + sim.score_blue) * 7)
     )
+    max_dist = min(220.0, pitch_width * 0.25)
+    dist = max_dist * (0.70 + (sweep % 4) * 0.08)
+    angle = -math.pi / 4 + ((sweep * 31.0) % 90.0) * (math.pi / 180.0)
+    bx = sim.center.x + (((sweep % 3) - 1) * (pitch_width * 0.12))
+    by = sim.center.y + ((((sweep // 3) % 3) - 1) * (pitch_height * 0.14))
 
-    max_dist = min(180.0, pitch_width * 0.22)
-    dist = max_dist * (0.75 + (sweep_idx % 4) * 0.08)
-    angle = -math.pi / 4 + ((sweep_idx * 31.0) % 90.0) * (math.pi / 180.0)
+  sim.ball.pos = Vec2(bx, by)
+  sim.ball.vel = Vec2(0.0, 0.0)
 
-    bx = sim.center.x + (((sweep_idx % 3) - 1) * (pitch_width * 0.12))
-    by = sim.center.y + ((((sweep_idx // 3) % 3) - 1) * (pitch_height * 0.15))
+  vx = dist * math.cos(angle)
+  vy = dist * math.sin(angle)
+  rx_lead, ry_lead = bx - vx, by - vy
+  bx_lead, by_lead = bx + vx, by + vy
 
-    sim.ball.pos = Vec2(bx, by)
-    sim.ball.vel = Vec2(0.0, 0.0)
+  # 2. Red Squad Placement (Defends Left, Attacks Right)
+  for idx, pl in enumerate(sim.red_team):
+    if idx == 0:
+      px = max(p.left + safe_m, min(p.right - safe_m, rx_lead))
+      py = max(p.top + safe_m, min(p.bottom - safe_m, ry_lead))
+    else:
+      # Defensive stagger behind duelist with alternating lane distribution
+      back_offset = min(240.0, max(120.0, (rx_lead - p.left) * 0.45))
+      px = max(p.left + safe_m, rx_lead - back_offset)
+      lane_sign = 1.0 if (idx % 2 == 1) else -1.0
+      py = sim.center.y + (lane_sign * (60.0 + idx * 55.0))
+      py = min(max(p.top + safe_m, py), p.bottom - safe_m)
 
-    vx = dist * math.cos(angle)
-    vy = dist * math.sin(angle)
+    pl.pos = Vec2(px, py)
+    pl.vel = Vec2(0.0, 0.0)
+    pl.kick_cooldown_timer = 0.0
 
-    sim.red_team[0].pos = Vec2(bx - vx, by - vy)
-    sim.red_team[0].vel = Vec2(0.0, 0.0)
-    sim.red_team[0].kick_cooldown_timer = 0.0
+  # 3. Blue Squad Placement (Defends Right, Attacks Left)
+  for idx, pl in enumerate(sim.blue_team):
+    if idx == 0:
+      px = max(p.left + safe_m, min(p.right - safe_m, bx_lead))
+      py = max(p.top + safe_m, min(p.bottom - safe_m, by_lead))
+    else:
+      back_offset = min(240.0, max(120.0, (p.right - bx_lead) * 0.45))
+      px = min(p.right - safe_m, bx_lead + back_offset)
+      lane_sign = -1.0 if (idx % 2 == 1) else 1.0
+      py = sim.center.y + (lane_sign * (60.0 + idx * 55.0))
+      py = min(max(p.top + safe_m, py), p.bottom - safe_m)
 
-    sim.blue_team[0].pos = Vec2(bx + vx, by + vy)
-    sim.blue_team[0].vel = Vec2(0.0, 0.0)
-    sim.blue_team[0].kick_cooldown_timer = 0.0
+    pl.pos = Vec2(px, py)
+    pl.vel = Vec2(0.0, 0.0)
+    pl.kick_cooldown_timer = 0.0
 
-  # Neutralize mode state to prevent background resets
   if hasattr(sim, "mode"):
     sim.mode.state = "PLAYING"
     if hasattr(sim.mode, "celebration_timer"):
       sim.mode.celebration_timer = 0.0
-    if hasattr(sim.mode, "goal_timer"):
-      sim.mode.goal_timer = 0.0
 
 
 def evaluate_and_generate_html(
-    model_or_path: str | nn.Module,
+    red_agent: str | nn.Module,
+    blue_agent: str | nn.Module,
+    red_team_size: int = 2,
+    blue_team_size: int | None = None,
     device: torch.device = torch.device("cpu"),
-    baseline_type: str = "heuristic",
     output_dir: str = "render/",
     filename: str = "match_replay.html",
-    num_episodes: int = 10,
-    max_steps: int = 1800,
+    num_episodes: int = 5,
+    max_steps: int = 2700,
     base_seed: int = 70000,
     pitch_width: float = 1200.0,
     pitch_height: float = 800.0,
     goal_height: float | None = 220.0,
 ) -> str:
-  """Runs continuous matches and exports an interactive HTML5 visual replay."""
+  """Renders multi-agent matches with arbitrary agent setups and exports an HTML5 viewer."""
   os.makedirs(output_dir, exist_ok=True)
   out_path = os.path.join(output_dir, filename)
 
-  # 1. Load Model
-  if isinstance(model_or_path, str):
-    model = ActorCritic().to(device)
-    ckpt = torch.load(model_or_path, map_location=device, weights_only=False)
-    state_dict = (
-        ckpt["model_state_dict"]
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt
-        else ckpt
-    )
-    model.load_state_dict(state_dict)
-  else:
-    model = model_or_path.to(device)
+  blue_size = blue_team_size if blue_team_size is not None else red_team_size
 
-  model.eval()
+  red_type, red_handler, red_name = _resolve_agent(red_agent, "red", device)
+  blue_type, blue_handler, blue_name = _resolve_agent(
+      blue_agent, "blue", device
+  )
 
   episodes_data = []
   dt = 1.0 / 60.0
   action_repeat = 4
 
-  heur_coord = TeamHeuristicCoordinator(team="blue")
-  heur_ctrl = HeuristicBotController(heur_coord)
-
-  # 2. Run Evaluation Episodes
   for ep_idx in range(num_episodes):
     seed = base_seed + ep_idx
     random.seed(seed)
     np.random.seed(seed)
 
-    learner_ph = ActionPlaceholder()
-    opp_ph = ActionPlaceholder()
+    red_phs = [ActionPlaceholder() for _ in range(red_team_size)]
+    blue_phs = [ActionPlaceholder() for _ in range(blue_size)]
 
-    roster = [
-        PlayerSlot(
-            "red",
-            PlayerStats("Learner_Red", accel=3200.0),
-            learner_ph,
-        ),
-        PlayerSlot(
-            "blue",
-            PlayerStats("Opponent_Blue", accel=3200.0),
-            opp_ph,
-        ),
-    ]
+    roster = []
+    for i in range(red_team_size):
+      roster.append(
+          PlayerSlot("red", PlayerStats(f"Red_{i+1}", accel=3200.0), red_phs[i])
+      )
+    for j in range(blue_size):
+      roster.append(
+          PlayerSlot(
+              "blue", PlayerStats(f"Blue_{j+1}", accel=3200.0), blue_phs[j]
+          )
+      )
 
     cfg = MatchConfig(
         mode=ClassicMatchMode(time_limit=max_steps * dt, score_limit=99),
@@ -175,7 +253,6 @@ def evaluate_and_generate_html(
         goal_height=goal_height,
     )
 
-    # Disable mode's uncoordinated internal resets
     if hasattr(sim, "mode"):
       sim.mode.state = "PLAYING"
       if hasattr(sim.mode, "reset_positions"):
@@ -184,7 +261,7 @@ def evaluate_and_generate_html(
     sim.score_red = 0
     sim.score_blue = 0
 
-    _apply_eval_restart(
+    _apply_general_restart(
         sim,
         ep_idx=ep_idx,
         is_initial=True,
@@ -208,43 +285,26 @@ def evaluate_and_generate_html(
     frames = []
 
     for step in range(max_steps):
-      # 1. Update Decisions at 15 Hz (Every 4 frames)
+      # 1. Update Decisions at 15 Hz
       if step % action_repeat == 0:
-        # Learner
-        obs = extract_actor_obs(sim, sim.red_team[0], "red")
-        obs_t = torch.as_tensor(
-            obs, dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        with torch.no_grad():
-          act, _, _, _ = model.get_action_and_value(obs_t, deterministic=True)
-        m_idx = int(act[0, 0].item())
-        ex, ey = _EGO_DIRS[m_idx]
-        learner_ph.action = (Vec2(ex, ey), bool(act[0, 1].item()))
-
-        # Opponent
-        if baseline_type == "heuristic":
-          opp_ph.action = heur_ctrl.get_action(1, sim)
-        else:
-          opp_ph.action = (
-              random.choice([Vec2(dx, dy) for dx, dy in _EGO_DIRS]),
-              random.random() < 0.20,
+        for idx, pl in enumerate(sim.red_team):
+          global_idx = sim.all_players.index(pl)
+          red_phs[idx].action = _query_agent_action(
+              red_type, red_handler, "red", global_idx, pl, sim, device
+          )
+        for idx, pl in enumerate(sim.blue_team):
+          global_idx = sim.all_players.index(pl)
+          blue_phs[idx].action = _query_agent_action(
+              blue_type, blue_handler, "blue", global_idx, pl, sim, device
           )
 
-      # 2. Advance Physics Substep
+      # 2. Physics Step (Single Call - No Double Counting)
       goal_event = sim.step(dt)
 
-      # Guarantee mode stays in PLAYING state so it never ignores goals
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
 
-      # 3. Record Frame (Post-step so ball crossing the line is visible)
-      players_state = []
-
-      # Guarantee mode stays in PLAYING state
-      if hasattr(sim, "mode"):
-        sim.mode.state = "PLAYING"
-
-      # 4. Record Frame (Post-step so ball crossing the line is visible)
+      # 3. Snapshot Frame State
       players_state = []
       for player in sim.all_players:
         players_state.append({
@@ -276,9 +336,9 @@ def evaluate_and_generate_html(
           "goal_event": goal_event,
       })
 
-      # 5. Restart from Contested Geometry on Goal
+      # 4. Handle Continuous Reset on Goal
       if goal_event is not None:
-        _apply_eval_restart(
+        _apply_general_restart(
             sim,
             ep_idx=ep_idx,
             is_initial=False,
@@ -288,14 +348,13 @@ def evaluate_and_generate_html(
 
     episodes_data.append({
         "episode_idx": ep_idx + 1,
-        "learner_team": "red",
-        "opponent": baseline_type,
+        "red_agent": f"{red_name} ({red_team_size}p)",
+        "blue_agent": f"{blue_name} ({blue_size}p)",
         "seed": seed,
         "final_score": f"{sim.score_red} - {sim.score_blue}",
         "frames": frames,
     })
 
-  # 3. Export HTML Replay
   html_content = _build_html_template(pitch_data, episodes_data)
   with open(out_path, "w", encoding="utf-8") as f:
     f.write(html_content)
@@ -312,7 +371,7 @@ def _build_html_template(pitch_data: dict, episodes_data: list) -> str:
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Haxball RL Replay Viewer</title>
+<title>Haxball Multi-Agent Match Viewer</title>
 <style>
   body {{
     margin: 0;
@@ -325,7 +384,7 @@ def _build_html_template(pitch_data: dict, episodes_data: list) -> str:
     align-items: center;
   }}
   .container {{
-    max-width: 1000px;
+    max-width: 1060px;
     width: 100%;
     background: #1e293b;
     border-radius: 12px;
@@ -429,7 +488,7 @@ def _build_html_template(pitch_data: dict, episodes_data: list) -> str:
   </div>
 
   <div class="canvas-wrapper">
-    <canvas id="pitchCanvas" width="900" height="550"></canvas>
+    <canvas id="pitchCanvas" width="960" height="560"></canvas>
   </div>
 
   <div class="controls">
@@ -508,7 +567,7 @@ const telKickState = document.getElementById("telKickState");
 episodes.forEach((ep, idx) => {{
   const opt = document.createElement("option");
   opt.value = idx;
-  opt.textContent = `Match ${{ep.episode_idx}}: Learner vs ${{ep.opponent.toUpperCase()}} (${{ep.final_score}})`;
+  opt.textContent = `Match ${{ep.episode_idx}}: ${{ep.red_agent}} vs ${{ep.blue_agent}} (${{ep.final_score}})`;
   epSelect.appendChild(opt);
 }});
 
@@ -522,7 +581,7 @@ function loadEpisode(idx) {{
   const ep = episodes[currentEpIdx];
   scrubber.max = Math.max(0, ep.frames.length - 1);
   scrubber.value = 0;
-  telMatchup.innerHTML = `<span style="color:#ef4444">Learner (Red)</span> vs <span style="color:#3b82f6">${{ep.opponent.toUpperCase()}} (Blue)</span>`;
+  telMatchup.innerHTML = `<span style="color:#ef4444">${{ep.red_agent}}</span> vs <span style="color:#3b82f6">${{ep.blue_agent}}</span>`;
   renderFrame();
 }}
 
@@ -666,7 +725,8 @@ function renderFrame() {{
   ctx.fillRect(right, goalTop, goalWidth, goalBottom - goalTop);
   ctx.strokeRect(right, goalTop, goalWidth, goalBottom - goalTop);
 
-  frame.players.forEach(p => {{
+  // Render Players with Jersey Numbers
+  frame.players.forEach((p, idx) => {{
     const px = toScreenX(p.x);
     const py = toScreenY(p.y);
     const pr = p.r * scale;
@@ -687,17 +747,27 @@ function renderFrame() {{
     ctx.lineWidth = 2;
     ctx.stroke();
 
+    // Player Number Tag
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `bold ${{Math.round(11 * scale)}}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const num = p.name.split("_")[1] || (idx + 1);
+    ctx.fillText(num, px, py);
+
+    // Orientation Heading
     if (Math.hypot(p.vx, p.vy) > 10) {{
       const headingAngle = Math.atan2(p.vy, p.vx);
       ctx.beginPath();
       ctx.moveTo(px, py);
       ctx.lineTo(px + Math.cos(headingAngle) * pr * 1.5, py + Math.sin(headingAngle) * pr * 1.5);
-      ctx.strokeStyle = "#ffffff";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
       ctx.lineWidth = 2;
       ctx.stroke();
     }}
   }});
 
+  // Render Ball
   const bx = toScreenX(frame.ball.x);
   const by = toScreenY(frame.ball.y);
   const br = frame.ball.r * scale;

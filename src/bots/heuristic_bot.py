@@ -1,196 +1,271 @@
+import math
 from src.engine.entities import Player
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
 
+
 class TeamHeuristicCoordinator:
-    """
-    Advanced Multi-Agent Heuristic Coordinator featuring:
-    - Aggressive forward kicking & self-passing
-    - Cross-product Arc-Around pathing (prevents backward clipping)
-    - Ray-Casted Shot suppression (only holds ball if blocked)
-    """
+  """Role-locked tactical multi-agent coordinator:
 
-    def __init__(self, team: str = "blue"):
-        self.team = team
-        self._last_chaser = None
-        self._last_ball_pos = None
+  - Fixed non-swapping roles (GK, Sweeper, Striker)
+  - Predictive trajectory interception (leads the ball)
+  - Open-corner post sniping (corners rather than net center)
+  - Defensive half boundary clamping for GK
+  - Targeted clearance passing to open strikers
+  """
 
-    def _is_path_blocked(self, start: Vec2, end: Vec2, opponents: list[Player], radius_threshold: float = 35.0) -> bool:
-        """Raycast check to see if an opponent blocks the shot trajectory."""
-        ray = end - start
-        ray_len = ray.length()
-        if ray_len == 0:
-            return False
-        
-        ray_dir = ray.normalize()
-        
-        for opp in opponents:
-            to_opp = opp.pos - start
-            proj_length = to_opp.x * ray_dir.x + to_opp.y * ray_dir.y
-            
-            # Check if opponent is between ball and target
-            if 0 < proj_length < ray_len:
-                perp_dist = abs(to_opp.x * (-ray_dir.y) + to_opp.y * ray_dir.x)
-                if perp_dist < radius_threshold:
-                    return True
-        return False
+  def __init__(self, team: str = "blue"):
+    self.team = team
 
-    def get_action(self, bot_player: Player, sim: Simulation) -> tuple[Vec2, bool]:
-        my_team = sim.red_team if self.team == "red" else sim.blue_team
-        opp_team = sim.blue_team if self.team == "red" else sim.red_team
-        ball = sim.ball
-        p = sim.pitch
-        sign = 1.0 if self.team == "red" else -1.0
+  def _is_path_blocked(
+      self,
+      start: Vec2,
+      end: Vec2,
+      opponents: list[Player],
+      radius_threshold: float = 38.0,
+  ) -> bool:
+    """Raycast check to see if an opponent obstructs a shot or passing trajectory."""
+    ray = end - start
+    ray_len = ray.length()
+    if ray_len < 1e-4:
+      return False
 
-        pitch_width = p.bottom - p.top
-        pitch_length = p.right - p.left
-        
-        own_goal_x = p.left if self.team == "red" else p.right
-        opp_goal_x = p.right if self.team == "red" else p.left
-        own_goal_pos = Vec2(own_goal_x, sim.center.y)
-        opp_goal_pos = Vec2(opp_goal_x, sim.center.y)
-        
-        # The vector pointing straight from the ball to the center of the opponent's net
-        goal_dir = (opp_goal_pos - ball.pos).normalize()
+    ray_dir = ray.normalize()
+    for opp in opponents:
+      to_opp = opp.pos - start
+      proj = to_opp.x * ray_dir.x + to_opp.y * ray_dir.y
+      if 0.0 < proj < ray_len:
+        perp_dist = abs(to_opp.x * (-ray_dir.y) + to_opp.y * ray_dir.x)
+        if perp_dist < radius_threshold:
+          return True
+    return False
 
-        ball_in_own_half = (sign * (ball.pos.x - sim.center.x) < 0)
-        dist_ball_to_own_goal = ball.pos.distance_to(own_goal_pos)
+  def _determine_role(self, bot_player: Player, my_team: list[Player]) -> str:
+    """Assigns deterministic, non-swapping tactical roles by roster index."""
+    if len(my_team) == 1:
+      return "STRIKER"
 
-        # 1. Assign Active Chaser
-        if self._last_ball_pos != ball.pos:
-            self._last_ball_pos = ball.pos
-            self._last_chaser = self._select_best_chaser(my_team, ball, goal_dir, own_goal_pos, pitch_length)
+    try:
+      idx = my_team.index(bot_player)
+    except ValueError:
+      return "STRIKER"
 
-        is_chaser = (bot_player == self._last_chaser)
-        
-        # 2. Assign Goalkeeper
-        is_gk = False
-        gk_player = None
-        if not is_chaser:
-            candidates_gk = [pl for pl in my_team if pl != self._last_chaser]
-            if candidates_gk:
-                gk_player = min(candidates_gk, key=lambda pl: pl.pos.distance_to(own_goal_pos))
-                is_gk = (bot_player == gk_player)
+    if len(my_team) == 2:
+      return "GK" if idx == 0 else "STRIKER"
+    else:
+      # 3v3 setup: 1 GK, 1 Sweeper/Defender, 1 Striker
+      if idx == 0:
+        return "GK"
+      elif idx == 1:
+        return "DEFENDER"
+      return "STRIKER"
 
-        # 3. Movement Target Calculation
-        target = bot_player.pos
+  def _select_shot_target(
+      self,
+      pred_ball: Vec2,
+      opp_team: list[Player],
+      opp_goal_x: float,
+      center_y: float,
+      goal_h: float,
+  ) -> Vec2:
+    """Selects the most vulnerable goal post corner furthest from the opponent keeper."""
+    post_margin = 18.0
+    top_post = Vec2(opp_goal_x, center_y - (goal_h * 0.5) + post_margin)
+    bot_post = Vec2(opp_goal_x, center_y + (goal_h * 0.5) - post_margin)
 
-        if is_chaser:
-            if is_gk:
-                # GK clears ball aggressively forward
-                target = Vec2(ball.pos.x + (sign * 50.0), ball.pos.y)
-            else:
-                bot_to_ball = ball.pos - bot_player.pos
-                dist_to_ball = bot_to_ball.length()
-                dir_to_ball = bot_to_ball.normalize() if dist_to_ball > 0 else goal_dir
-                
-                # Alignment: 1.0 is perfectly behind the ball.
-                alignment = dir_to_ball.x * goal_dir.x + dir_to_ball.y * goal_dir.y
+    if not opp_team:
+      return Vec2(opp_goal_x, center_y)
 
-                if alignment > 0.25:
-                    # PHASE 1: CHARGE (Aggressive Attack)
-                    # Target a point slightly *through* the ball to maintain a straight power drive
-                    target = ball.pos + (goal_dir * 20.0)
-                else:
-                    # PHASE 2: ARC AROUND (Repositioning)
-                    behind_ball = ball.pos - (goal_dir * 55.0)
-                    
-                    if dist_to_ball < 120.0:
-                        # Use cross-product to find the shortest evasion path (left or right)
-                        cross = goal_dir.x * bot_to_ball.y - goal_dir.y * bot_to_ball.x
-                        side = 1.0 if cross > 0 else -1.0
-                        perp = Vec2(-goal_dir.y * side, goal_dir.x * side)
-                        
-                        # Step wider the closer the bot is to the ball to prevent clipping
-                        evasion_weight = max(0.0, 1.0 - (dist_to_ball / 120.0))
-                        target = behind_ball + (perp * 85.0 * evasion_weight)
-                    else:
-                        target = behind_ball
-        else:
-            if is_gk:
-                to_ball = (ball.pos - own_goal_pos)
-                if to_ball.length_sq() > 0:
-                    to_ball = to_ball.normalize()
-                
-                step_out = min(pitch_length * 0.08, dist_ball_to_own_goal * 0.2)
-                target = own_goal_pos + (to_ball * step_out)
-                
-                goal_half_width = pitch_width * 0.15
-                target.y = max(sim.center.y - goal_half_width, min(sim.center.y + goal_half_width, target.y))
-            else:
-                supports = sorted([pl for pl in my_team if pl not in (self._last_chaser, gk_player)], key=lambda pl: pl.pos.y)
-                if len(supports) > 0:
-                    my_rank = supports.index(bot_player)
-                    y_spacing = pitch_width / (len(supports) + 1)
-                    target_y = p.top + (y_spacing * (my_rank + 1))
-                    
-                    if ball_in_own_half:
-                        target_x = own_goal_x + (sign * pitch_length * 0.25)
-                    else:
-                        target_x = ball.pos.x - (sign * pitch_length * 0.15)
-                    target = Vec2(target_x, target_y)
+    # Find opponent closest to the goal line (the active keeper)
+    opp_gk = min(
+        opp_team, key=lambda opp: abs(opp.pos.x - opp_goal_x)
+    )
 
-        # Boundary Clamping
-        padding = bot_player.radius + 8.0
-        target.x = max(p.outer_left + padding, min(p.outer_right - padding, target.x))
-        target.y = max(p.outer_top + padding, min(p.outer_bottom - padding, target.y))
+    # Aim for the post furthest from the opponent keeper's vertical position
+    dist_to_top = opp_gk.pos.distance_to(top_post)
+    dist_to_bot = opp_gk.pos.distance_to(bot_post)
 
-        to_target = target - bot_player.pos
-        dist_to_target = to_target.length()
-        move_dir = to_target.normalize() if dist_to_target > 5.0 else Vec2(0, 0)
+    # Prioritize unobstructed post
+    top_blocked = self._is_path_blocked(pred_ball, top_post, opp_team)
+    bot_blocked = self._is_path_blocked(pred_ball, bot_post, opp_team)
 
-        # 4. Smart Kicking Logic
-        kick = False
-        kick_reach = bot_player.radius + ball.radius + bot_player.stats.kick_margin + 6.0
+    if not top_blocked and bot_blocked:
+      return top_post
+    if not bot_blocked and top_blocked:
+      return bot_post
 
-        if bot_player.pos.distance_to(ball.pos) <= kick_reach:
-            bot_to_ball_dir = (ball.pos - bot_player.pos).normalize()
-            shot_alignment = bot_to_ball_dir.x * goal_dir.x + bot_to_ball_dir.y * goal_dir.y
+    return top_post if dist_to_top >= dist_to_bot else bot_post
 
-            if is_gk:
-                # GK clears anywhere away from own goal
-                if (bot_to_ball_dir.x * sign) > -0.1:
-                    kick = True
-            else:
-                # Condition A: Deep in own half? Clear it forward immediately.
-                if dist_ball_to_own_goal < (pitch_length * 0.3) and (bot_to_ball_dir.x * sign) > 0.1:
-                    kick = True
-                
-                # Condition B: Midfield or Attacking (Aligned for a shot/pass)
-                elif shot_alignment > 0.4:
-                    blocked = self._is_path_blocked(ball.pos, opp_goal_pos, opp_team, radius_threshold=35.0)
-                    
-                    if not blocked:
-                        kick = True
-                    else:
-                        # If blocked, but very close to the net, blast it anyway for a rebound
-                        if ball.pos.distance_to(opp_goal_pos) < (pitch_length * 0.25):
-                            kick = True
-                        # Otherwise, let physics dribble the ball left/right around the block
+  def get_action(
+      self, bot_player: Player, sim: Simulation
+  ) -> tuple[Vec2, bool]:
+    my_team = sim.red_team if self.team == "red" else sim.blue_team
+    opp_team = sim.blue_team if self.team == "red" else sim.red_team
+    ball = sim.ball
+    p = sim.pitch
+    sign = 1.0 if self.team == "red" else -1.0
 
-        return move_dir, kick
+    pitch_w = p.right - p.left
+    pitch_h = p.bottom - p.top
+    goal_h = getattr(p, "goal_height", 220.0)
 
-    def _select_best_chaser(self, team, ball, goal_dir, own_goal_pos, pitch_length):
-        best_chaser = team[0]
-        best_score = float('inf')
-        
-        # Emergency Override: If ball is in our box, closest player takes it
-        if ball.pos.distance_to(own_goal_pos) < pitch_length * 0.15:
-            return min(team, key=lambda pl: pl.pos.distance_to(own_goal_pos))
+    own_goal_x = p.left if self.team == "red" else p.right
+    opp_goal_x = p.right if self.team == "red" else p.left
+    own_goal_pos = Vec2(own_goal_x, sim.center.y)
 
-        for player in team:
-            to_ball = ball.pos - player.pos
-            dist = to_ball.length()
-            if dist > 0:
-                dir_to_ball = to_ball.normalize()
-                alignment = dir_to_ball.x * goal_dir.x + dir_to_ball.y * goal_dir.y
-                # Less severe angle penalty, allowing faster interceptors to take charge
-                angle_penalty = 1.5 - (alignment * 0.5)
-                score = dist * angle_penalty
-            else:
-                score = 0
-                
-            if score < best_score:
-                best_score = score
-                best_chaser = player
-        return best_chaser
+    role = self._determine_role(bot_player, my_team)
+    safe_m = bot_player.radius + 8.0
+
+    # ── 1. Ball Prediction (Interception Vector) ──
+    dist_to_ball = bot_player.pos.distance_to(ball.pos)
+    # Lead time scales dynamically with distance to anticipate ball velocity
+    lead_time = max(0.04, min(0.32, dist_to_ball / 750.0))
+    pred_ball_pos = ball.pos + (ball.vel * lead_time)
+
+    # ── 2. Strategy by Role ──
+    target = bot_player.pos
+    kick = False
+    kick_reach = (
+        bot_player.radius + ball.radius + bot_player.stats.kick_margin + 6.0
+    )
+
+    # ==========================================================
+    # ROLE: STRIKER
+    # ==========================================================
+    if role == "STRIKER":
+      shot_target = self._select_shot_target(
+          pred_ball_pos, opp_team, opp_goal_x, sim.center.y, goal_h
+      )
+      shot_dir = (shot_target - pred_ball_pos).normalize()
+
+      # Offset approach position (directly behind ball relative to chosen post)
+      ideal_strike_pos = pred_ball_pos - (shot_dir * (bot_player.radius + 14.0))
+
+      to_ball = pred_ball_pos - bot_player.pos
+      dist_ball = to_ball.length()
+      dir_to_ball = to_ball.normalize() if dist_ball > 0 else shot_dir
+
+      # Alignment: 1.0 = bot is in direct firing position behind ball
+      alignment = (
+          dir_to_ball.x * shot_dir.x + dir_to_ball.y * shot_dir.y
+      )
+
+      if alignment > 0.40:
+        # CHARGE: Drive straight through the ball into the corner
+        target = pred_ball_pos + (shot_dir * 30.0)
+      else:
+        # ARC AROUND: Curve around ball to prevent knocking it backward
+        cross = shot_dir.x * to_ball.y - shot_dir.y * to_ball.x
+        side = 1.0 if cross >= 0 else -1.0
+        perp = Vec2(-shot_dir.y * side, shot_dir.x * side)
+
+        evasion_weight = max(0.0, 1.0 - (dist_ball / 130.0))
+        target = ideal_strike_pos + (perp * 80.0 * evasion_weight)
+
+      # Striker Kick Timing
+      if bot_player.pos.distance_to(ball.pos) <= kick_reach:
+        bot_to_ball = (ball.pos - bot_player.pos).normalize()
+        # Ensure kick drives ball forward toward opponent half
+        if (bot_to_ball.x * sign) > 0.15:
+          shot_alignment = (
+              bot_to_ball.x * shot_dir.x + bot_to_ball.y * shot_dir.y
+          )
+          if shot_alignment > 0.35:
+            kick = True
+          # Rebound blast if within shooting distance
+          elif ball.pos.distance_to(Vec2(opp_goal_x, sim.center.y)) < (
+              pitch_w * 0.30
+          ):
+            kick = True
+
+    # ==========================================================
+    # ROLE: GOALKEEPER (Strict Defensive Half Lockdown)
+    # ==========================================================
+    elif role == "GK":
+      # Defends within defensive half: x restricted between goal line and 30% pitch depth
+      max_gk_advance = min(220.0, pitch_w * 0.25)
+      gk_base_x = own_goal_x + (sign * 60.0)
+
+      ball_in_defensive_box = (
+          sign * (ball.pos.x - own_goal_x) < (pitch_w * 0.22)
+          and abs(ball.pos.y - sim.center.y) < (goal_h * 1.2)
+      )
+
+      if ball_in_defensive_box:
+        # Step out to actively challenge and clear loose balls in the box
+        target = ball.pos
+      else:
+        # Guard goal line: track ball Y clamped inside goal width
+        to_ball = ball.pos - own_goal_pos
+        step_out = min(
+            max_gk_advance, max(45.0, to_ball.length() * 0.18)
+        )
+        target_x = own_goal_x + (sign * step_out)
+
+        goal_half = (goal_h * 0.5) - 10.0
+        target_y = min(
+            max(sim.center.y - goal_half, ball.pos.y), sim.center.y + goal_half
+        )
+        target = Vec2(target_x, target_y)
+
+      # Hard constraint: GK never crosses defensive line
+      max_x_allowed = sim.center.x - (sign * (pitch_w * 0.15))
+      if sign > 0:
+        target.x = min(target.x, max_x_allowed)
+      else:
+        target.x = max(target.x, max_x_allowed)
+
+      # Clearance / Passing Logic
+      if bot_player.pos.distance_to(ball.pos) <= kick_reach:
+        bot_to_ball = (ball.pos - bot_player.pos).normalize()
+        # Only kick forward into open field
+        if (bot_to_ball.x * sign) > -0.1:
+          kick = True
+
+    # ==========================================================
+    # ROLE: DEFENDER / SWEEPER (3v3 Midfield Anchor)
+    # ==========================================================
+    elif role == "DEFENDER":
+      # Holds space between GK and midfield line
+      ball_in_own_half = sign * (ball.pos.x - sim.center.x) < 0
+
+      if ball_in_own_half:
+        # Challenge loose balls in defensive midfield
+        target = pred_ball_pos - (
+            Vec2(sign, 0.0) * (bot_player.radius + 15.0)
+        )
+      else:
+        # Hold midfield anchor position to cut counter-attacks
+        anchor_x = sim.center.x - (sign * (pitch_w * 0.14))
+        # Mirror ball Y slightly to support attack lane
+        anchor_y = sim.center.y + (ball.pos.y - sim.center.y) * 0.45
+        target = Vec2(anchor_x, anchor_y)
+
+      # Clamp defender: never push beyond opponent 35% line
+      max_def_x = sim.center.x + (sign * (pitch_w * 0.15))
+      if sign > 0:
+        target.x = min(target.x, max_def_x)
+      else:
+        target.x = max(target.x, max_def_x)
+
+      # Clearance kick forward
+      if bot_player.pos.distance_to(ball.pos) <= kick_reach:
+        bot_to_ball = (ball.pos - bot_player.pos).normalize()
+        if (bot_to_ball.x * sign) > 0.0:
+          kick = True
+
+    # ── 3. Pitch Boundary Clamping & Motor Output ──
+    target.x = max(
+        p.outer_left + safe_m, min(p.outer_right - safe_m, target.x)
+    )
+    target.y = max(
+        p.outer_top + safe_m, min(p.outer_bottom - safe_m, target.y)
+    )
+
+    to_target = target - bot_player.pos
+    dist_target = to_target.length()
+    move_dir = (
+        to_target.normalize() if dist_target > 6.0 else Vec2(0.0, 0.0)
+    )
+
+    return move_dir, kick
