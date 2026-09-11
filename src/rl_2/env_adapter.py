@@ -55,16 +55,22 @@ class MatchEnv(gym.Env):
 
   def __init__(
       self,
-      team_size: int = 1,
+      team_size: int = 2,
+      learner_team_size: int | None = None,
+      opp_team_size: int | None = None,
       learner_team: str = "red",
-      max_round_steps: int = 1800,  # 30s default continuous match @ 60Hz
+      max_round_steps: int = 2700,
       goal_height: float | None = None,
       opponent_controller: Controller | None = None,
       pitch_width: float = 1200.0,
       pitch_height: float = 800.0,
   ):
     super().__init__()
-    self.team_size = team_size
+    # Decouple team sizes while preserving team_size for MAPPO buffer sizing
+    self.learner_team_size = learner_team_size or team_size
+    self.opp_team_size = opp_team_size or team_size
+    self.team_size = self.learner_team_size
+
     self.learner_team = learner_team
     self.opp_team = "blue" if learner_team == "red" else "red"
     self.max_round_steps = max_round_steps
@@ -85,7 +91,8 @@ class MatchEnv(gym.Env):
         (1.0, 1.0),  # 8: Forward-Down
     ]
 
-    if self.team_size == 1:
+    # Spaces strictly track the learner squad dimensions
+    if self.learner_team_size == 1:
       self.observation_space = spaces.Dict({
           "obs": spaces.Box(
               -1.0, 1.0, shape=(ACTOR_OBS_DIM,), dtype=np.float32
@@ -100,14 +107,16 @@ class MatchEnv(gym.Env):
           "obs": spaces.Box(
               -1.0,
               1.0,
-              shape=(self.team_size, ACTOR_OBS_DIM),
+              shape=(self.learner_team_size, ACTOR_OBS_DIM),
               dtype=np.float32,
           ),
           "state": spaces.Box(
               -1.0, 1.0, shape=(CRITIC_STATE_DIM,), dtype=np.float32
           ),
       })
-      self.action_space = spaces.MultiDiscrete([[9, 2]] * self.team_size)
+      self.action_space = spaces.MultiDiscrete(
+          [[9, 2]] * self.learner_team_size
+      )
 
     self.current_step = 0
     self.match_time_remaining = float(self.max_round_steps) / 60.0
@@ -116,12 +125,14 @@ class MatchEnv(gym.Env):
     self.opp_slots: list[tuple[int, PlayerSlot]] = []
     self._init_simulation()
 
+
   def _init_simulation(self):
     roster = []
     self.learner_slots = []
     self.opp_slots = []
 
-    for i in range(self.team_size):
+    # 1. Populate Learner Squad (e.g., 2 RL players)
+    for i in range(self.learner_team_size):
       ph = ActionPlaceholder()
       slot = PlayerSlot(
           self.learner_team,
@@ -131,7 +142,8 @@ class MatchEnv(gym.Env):
       roster.append(slot)
       self.learner_slots.append((i, slot))
 
-    for j in range(self.team_size):
+    # 2. Populate Opponent Squad (e.g., 3 Heuristic bots)
+    for j in range(self.opp_team_size):
       ph_opp = ActionPlaceholder()
       slot = PlayerSlot(
           self.opp_team,
@@ -139,7 +151,7 @@ class MatchEnv(gym.Env):
           ph_opp,
       )
       roster.append(slot)
-      self.opp_slots.append((self.team_size + j, slot))
+      self.opp_slots.append((self.learner_team_size + j, slot))
 
     match_cfg = MatchConfig(
         mode=ClassicMatchMode(
@@ -157,166 +169,164 @@ class MatchEnv(gym.Env):
         goal_height=self.goal_height,
     )
 
+    # ── DISABLE INTERNAL ENGINE CELEBRATION & TELEPORTS ──
+    if hasattr(self.sim, "mode"):
+      self.sim.mode.state = "PLAYING"
+      if hasattr(self.sim.mode, "reset_positions"):
+        self.sim.mode.reset_positions = lambda *args, **kwargs: None
+
+
   def _reset_pitch_state(self, standard_kickoff: bool = False):
-    """Executes multi-modal scenario resets to eliminate dead-ball limit cycles and expand exploration."""
+    """Executes 6 structured tactical phase resets to eliminate clustering."""
     p = self.sim.pitch
     ball = self.sim.ball
+    roll = random.random()
 
-    pitch_w = p.right - p.left
-    pitch_h = p.bottom - p.top
-    is_wide_goal = bool(self.goal_height and self.goal_height >= 400.0)
-
-    # ── 1. Phase 1 Override: Wide-Net Striking Discovery ──
-    if is_wide_goal:
-      bx = random.uniform(p.left + 200.0, p.right - 220.0)
-      by = random.uniform(p.top + 70.0, p.bottom - 70.0)
-      ball.pos = Vec2(bx, by)
-      ball.vel = Vec2(0.0, 0.0)
-
-      dist_l = random.uniform(80.0, 150.0)
-      angle_l = random.uniform(-math.pi / 4, math.pi / 4)
-      rx = max(p.left + 45.0, bx - dist_l * math.cos(angle_l))
-      ry = min(
-          max(p.top + 45.0, by - dist_l * math.sin(angle_l)), p.bottom - 45.0
-      )
-
-      opp_x = random.uniform(p.right - 180.0, p.right - 60.0)
-      opp_y = random.choice([
-          random.uniform(p.top + 50.0, p.top + 120.0),
-          random.uniform(p.bottom - 120.0, p.bottom - 50.0),
-      ])
-
-      for idx, pl in enumerate(self.sim.red_team):
-        pl.pos = Vec2(rx, ry + (idx * 40.0))
-        pl.vel = Vec2(0.0, 0.0)
-        pl.kick_cooldown_timer = 0.0
-
-      for idx, pl in enumerate(self.sim.blue_team):
-        pl.pos = Vec2(opp_x, opp_y - (idx * 40.0))
-        pl.vel = Vec2(0.0, 0.0)
-        pl.kick_cooldown_timer = 0.0
-      return
-
-    # ── 2. Standard Center Kickoff (15% or Forced Fallback) ──
-    if standard_kickoff or random.random() < 0.15:
+    # ── 1. Standard Center Kickoff (10%) ──
+    if standard_kickoff or roll < 0.10:
       ball.pos = Vec2(self.sim.center.x, self.sim.center.y)
       ball.vel = Vec2(0.0, 0.0)
-
-      offset_x = min(140.0, pitch_w * 0.16)
-      for idx, pl in enumerate(self.sim.red_team):
-        pl.pos = Vec2(
-            self.sim.center.x - offset_x, self.sim.center.y + (idx * 50.0)
-        )
-        pl.vel = Vec2(0.0, 0.0)
-        pl.kick_cooldown_timer = 0.0
-
-      for idx, pl in enumerate(self.sim.blue_team):
-        pl.pos = Vec2(
-            self.sim.center.x + offset_x, self.sim.center.y - (idx * 50.0)
-        )
-        pl.vel = Vec2(0.0, 0.0)
-        pl.kick_cooldown_timer = 0.0
+      r_coords = [
+          Vec2(self.sim.center.x - 140.0, self.sim.center.y),
+          Vec2(self.sim.center.x - 240.0, self.sim.center.y + 110.0),
+      ]
+      b_coords = [
+          Vec2(self.sim.center.x + 140.0, self.sim.center.y),
+          Vec2(self.sim.center.x + 240.0, self.sim.center.y - 110.0),
+          Vec2(p.right - 100.0, self.sim.center.y),  # Extra defender/GK if 3v3
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
       return
 
-    scenario_roll = random.random()
+    # ── 2. Defensive Breakout & Clearance (20%) ──
+    # Red P1 trapped in box corner with ball; Red P2 open in midfield
+    elif roll < 0.30:
+      bx = p.left + 120.0
+      by = random.choice([p.top + 90.0, p.bottom - 90.0])
+      ball.pos = Vec2(bx, by)
+      ball.vel = Vec2(0.0, 0.0)
+
+      outlet_y = p.bottom - 130.0 if by < self.sim.center.y else p.top + 130.0
+      r_coords = [
+          Vec2(bx - 35.0, by),  # Trapped press target
+          Vec2(self.sim.center.x - 80.0, outlet_y),  # Wide outlet runner
+      ]
+      b_coords = [
+          Vec2(bx + 65.0, by),  # Pressing striker
+          Vec2(self.sim.center.x + 80.0, self.sim.center.y),  # Covering anchor
+          Vec2(p.right - 60.0, self.sim.center.y),  # Deep GK
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
+      return
+
+    # ── 3. Wing Cross & Cutback (20%) ──
+    # Red P1 drives down the wing; Red P2 runs central to attack the box
+    elif roll < 0.50:
+      wing_y = random.choice([p.top + 60.0, p.bottom - 60.0])
+      bx = p.right - 170.0
+      ball.pos = Vec2(bx, wing_y)
+      ball.vel = Vec2(0.0, 0.0)
+
+      r_coords = [
+          Vec2(bx - 35.0, wing_y),  # Winger
+          Vec2(p.right - 200.0, self.sim.center.y),  # Target man waiting central
+      ]
+      b_coords = [
+          Vec2(p.right - 55.0, self.sim.center.y),  # Goalkeeper on line
+          Vec2(p.right - 140.0, wing_y + (60.0 if wing_y < self.sim.center.y else -60.0)),  # Wing defender
+          Vec2(p.right - 160.0, self.sim.center.y),  # Central sweeper
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
+      return
+
+    # ── 4. 2v1 Fast-Break Overload (20%) ──
+    # Red breaks with forward momentum in two lateral lanes
+    elif roll < 0.70:
+      bx = self.sim.center.x - 40.0
+      by = self.sim.center.y - 120.0
+      ball.pos = Vec2(bx, by)
+      ball.vel = Vec2(140.0, 0.0)
+
+      r_coords = [
+          Vec2(bx - 35.0, by),  # Ball carrier (top lane)
+          Vec2(bx - 35.0, self.sim.center.y + 130.0),  # Weak-side runner (bottom lane)
+      ]
+      b_coords = [
+          Vec2(p.right - 220.0, self.sim.center.y),  # Back-pedaling defender
+          Vec2(p.right - 60.0, self.sim.center.y),  # Goalkeeper
+          Vec2(p.right - 180.0, self.sim.center.y + 120.0),  # Recovery runner
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
+      return
+
+    # ── 5. Emergency Goal-Line Stand (15%) ──
+    # Blue takes a heavy shot; Red must defend the goal and clear
+    elif roll < 0.85:
+      bx = p.left + 220.0
+      by = random.uniform(p.top + 160.0, p.bottom - 160.0)
+      ball.pos = Vec2(bx, by)
+      ball.vel = Vec2(-180.0, 0.0)
+
+      r_coords = [
+          Vec2(p.left + 50.0, self.sim.center.y),  # Red GK
+          Vec2(p.left + 140.0, by + 40.0),  # Red Sweeper
+      ]
+      b_coords = [
+          Vec2(bx + 45.0, by),  # Blue Striker
+          Vec2(self.sim.center.x, self.sim.center.y),  # Blue Midfielder
+          Vec2(p.right - 70.0, self.sim.center.y),  # Blue GK
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
+      return
+
+    # ── 6. Staggered Midfield Scramble (15%) ──
+    else:
+      bx = random.uniform(self.sim.center.x - 80.0, self.sim.center.x + 80.0)
+      by = random.uniform(p.top + 120.0, p.bottom - 120.0)
+      ball.pos = Vec2(bx, by)
+      ball.vel = Vec2(random.uniform(-70.0, 70.0), random.uniform(-70.0, 70.0))
+
+      r_coords = [
+          Vec2(bx - 120.0, by),
+          Vec2(bx - 260.0, p.bottom - 140.0 if by < self.sim.center.y else p.top + 140.0),
+      ]
+      b_coords = [
+          Vec2(bx + 120.0, by),
+          Vec2(bx + 260.0, p.top + 140.0 if by < self.sim.center.y else p.bottom - 140.0),
+          Vec2(p.right - 80.0, self.sim.center.y),
+      ]
+      self._apply_tactical_layout(r_coords, b_coords)
+
+  def _apply_tactical_layout(self, r_coords: list[Vec2], b_coords: list[Vec2]):
+    """Safely clamps positions to pitch boundaries and resets all player velocities."""
+    p = self.sim.pitch
     safe_m = 48.0
 
-    # ── 3. Scenario: Rail & Wall Scramble (20%) ──
-    # Prevents limit cycles and dead-ball freezes along the side bumpers
-    if scenario_roll < 0.20:
-      bx = random.uniform(p.left + 220.0, p.right - 220.0)
-      # Ball pinned right next to top or bottom rail (radius ~10px)
-      on_top_rail = random.random() < 0.5
-      by = (p.top + 26.0) if on_top_rail else (p.bottom - 26.0)
-      ball.pos = Vec2(bx, by)
-      ball.vel = Vec2(random.uniform(-60.0, 60.0), 0.0)
+    for idx, pl in enumerate(self.sim.red_team):
+      target = (
+          r_coords[idx]
+          if idx < len(r_coords)
+          else Vec2(self.sim.center.x - 180.0 - idx * 40.0, self.sim.center.y)
+      )
+      pl.pos = Vec2(
+          max(p.left + safe_m, min(p.right - safe_m, target.x)),
+          max(p.top + safe_m, min(p.bottom - safe_m, target.y)),
+      )
+      pl.vel = Vec2(0.0, 0.0)
+      pl.kick_cooldown_timer = 0.0
 
-      # Red approaches from defensive side, Blue challenges from offensive side
-      dist_r = random.uniform(90.0, 220.0)
-      dist_b = random.uniform(90.0, 240.0)
-      rx = max(p.left + safe_m, bx - dist_r)
-      ry = (by + 40.0) if on_top_rail else (by - 40.0)
-      bx_pos = min(p.right - safe_m, bx + dist_b)
-      by_pos = (by + 40.0) if on_top_rail else (by - 40.0)
-
-      self._apply_squad_positions(rx, ry, bx_pos, by_pos)
-      return
-
-    # ── 4. Scenario: Deep Corner & Pocket Extraction (15%) ──
-    # Teaches peeling balls out of corners and wing crossings
-    elif scenario_roll < 0.35:
-      corner_x = random.choice([p.left + 120.0, p.right - 120.0])
-      corner_y = random.choice([p.top + 70.0, p.bottom - 70.0])
-      ball.pos = Vec2(corner_x, corner_y)
-      # Impart slight outwards rolling velocity
-      vx = 80.0 if corner_x < self.sim.center.x else -80.0
-      vy = 80.0 if corner_y < self.sim.center.y else -80.0
-      ball.vel = Vec2(vx, vy)
-
-      rx = max(p.left + safe_m, corner_x - 140.0) if corner_x > p.left + 150.0 else (p.left + safe_m)
-      ry = corner_y
-      bx_pos = min(p.right - safe_m, corner_x + 160.0)
-      by_pos = min(max(p.top + safe_m, corner_y), p.bottom - safe_m)
-
-      self._apply_squad_positions(rx, ry, bx_pos, by_pos)
-      return
-
-    # ── 5. Scenario: Dynamic Moving Ball / Transition Play (15%) ──
-    # Eliminates static ball assumption; agent learns trajectory interception
-    elif scenario_roll < 0.50:
-      bx = random.uniform(p.left + 260.0, p.right - 260.0)
-      by = random.uniform(p.top + 100.0, p.bottom - 100.0)
-      ball.pos = Vec2(bx, by)
-      # Ball moving with active match momentum (150-400 px/s)
-      speed = random.uniform(150.0, 400.0)
-      ang = random.uniform(0.0, 2.0 * math.pi)
-      ball.vel = Vec2(speed * math.cos(ang), speed * math.sin(ang))
-
-      dist = random.uniform(180.0, 360.0)
-      rx = max(p.left + safe_m, bx - dist * 0.8)
-      ry = min(max(p.top + safe_m, by + random.uniform(-100.0, 100.0)), p.bottom - safe_m)
-      bx_pos = min(p.right - safe_m, bx + dist * 0.8)
-      by_pos = min(max(p.top + safe_m, by + random.uniform(-100.0, 100.0)), p.bottom - safe_m)
-
-      self._apply_squad_positions(rx, ry, bx_pos, by_pos)
-      return
-
-    # ── 6. Scenario: Full-Pitch Point-Symmetric Contest (50%) ──
-    # Broad exploration across close duels (100px) and deep recoveries (500px)
-    margin_x = min(180.0, pitch_w * 0.16)
-    margin_y = min(80.0, pitch_h * 0.12)
-    bx = random.uniform(p.left + margin_x, p.right - margin_x)
-    by = random.uniform(p.top + margin_y, p.bottom - margin_y)
-    ball.pos = Vec2(bx, by)
-    ball.vel = Vec2(0.0, 0.0)
-
-    max_dist = min(500.0, pitch_w * 0.42)
-    min_dist = 100.0
-    placed = False
-
-    for _ in range(50):
-      dist = random.uniform(min_dist, max_dist)
-      # [-60°, +60°] guarantees cos(angle) >= 0.5 (Red strictly stays on defense side)
-      angle = random.uniform(-math.pi / 3, math.pi / 3)
-      vx = dist * math.cos(angle)
-      vy = dist * math.sin(angle)
-
-      r_x, r_y = bx - vx, by - vy
-      b_x, b_y = bx + vx, by + vy
-
-      if (
-          p.left + safe_m <= r_x <= p.right - safe_m
-          and p.top + safe_m <= r_y <= p.bottom - safe_m
-          and p.left + safe_m <= b_x <= p.right - safe_m
-          and p.top + safe_m <= b_y <= p.bottom - safe_m
-      ):
-        self._apply_squad_positions(r_x, r_y, b_x, b_y)
-        placed = True
-        break
-
-    if not placed:
-      self._reset_pitch_state(standard_kickoff=True)
-
+    for idx, pl in enumerate(self.sim.blue_team):
+      target = (
+          b_coords[idx]
+          if idx < len(b_coords)
+          else Vec2(self.sim.center.x + 180.0 + idx * 40.0, self.sim.center.y)
+      )
+      pl.pos = Vec2(
+          max(p.left + safe_m, min(p.right - safe_m, target.x)),
+          max(p.top + safe_m, min(p.bottom - safe_m, target.y)),
+      )
+      pl.vel = Vec2(0.0, 0.0)
+      pl.kick_cooldown_timer = 0.0
 
   def _apply_squad_positions(self, rx: float, ry: float, bx: float, by: float):
     """Universal NvN squad placer with point-symmetric randomization.
@@ -448,8 +458,6 @@ class MatchEnv(gym.Env):
         placed_blue.append(fallback_b)
 
 
-
-
   def _get_obs_payload(self) -> dict[str, np.ndarray]:
     team_squad = (
         self.sim.red_team
@@ -462,11 +470,9 @@ class MatchEnv(gym.Env):
     ]
     state = extract_global_state(self.sim, self.learner_team)
 
-    if self.team_size == 1:
+    if self.learner_team_size == 1:
       return {"obs": obs_list[0], "state": state}
     return {"obs": np.array(obs_list, dtype=np.float32), "state": state}
-
-
 
   def reset(self, seed: int | None = None, options: dict | None = None):
     super().reset(seed=seed)
@@ -496,7 +502,7 @@ class MatchEnv(gym.Env):
 
     # 1. Update Learner Actions (15 Hz decision window)
     sign = 1.0 if self.learner_team == "red" else -1.0
-    actions = [action] if self.team_size == 1 else action
+    actions = [action] if self.learner_team_size == 1 else action
     for i, (_, slot) in enumerate(self.learner_slots):
       m_idx = int(actions[i][0])
       kick = bool(actions[i][1])
@@ -518,6 +524,9 @@ class MatchEnv(gym.Env):
         self.sim.mode.time_remaining = self.match_time_remaining
 
       goal_event = self.sim.step(dt)
+
+      if hasattr(self.sim, "mode"):
+        self.sim.mode.state = "PLAYING"
 
       # In-Match Continuous Goal Handling
       if goal_event is not None:

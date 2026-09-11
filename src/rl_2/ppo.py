@@ -15,6 +15,7 @@ def train_mappo(
     model: ActorCritic,
     device: torch.device,
     team_size: int = 1,
+    opp_team_size: int | None = None,
     total_timesteps: int = 10_000_000,
     num_envs: int = 16,
     num_steps: int = 256,
@@ -195,7 +196,7 @@ def train_mappo(
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value Loss
-                v_loss = 0.5 * ((newvalue - b_returns[mb_idx]) ** 2).mean()
+                v_loss = 0.5 * ((newvalue.flatten() - b_returns[mb_idx]) ** 2).mean()
 
                 # Combined Objective
                 loss = pg_loss - curr_ent * entropy.mean() + vf_coef * v_loss
@@ -223,6 +224,7 @@ def train_mappo(
                 target_tier=target_tier,
                 filter_thresholds=filter_thresholds,
                 team_size=team_size,
+                opp_team_size=opp_team_size,  # Forwarded directly to pool
                 goal_height=goal_height,
                 pitch_width=pitch_width,
                 pitch_height=pitch_height,

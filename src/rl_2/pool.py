@@ -152,13 +152,15 @@ class SelfPlayPool:
       opponent_model: nn.Module | None = None,
       num_episodes: int = 40,
       team_size: int = 1,
+      opp_team_size: int | None = None,
       goal_height: float | None = None,
       pitch_width: float = 1200.0,
       pitch_height: float = 800.0,
-      max_steps: int = 1800,
+      max_steps: int = 2700,
       device: torch.device = torch.device("cpu"),
       eval_seed: int = 42,
   ) -> dict:
+    """Evaluates arbitrary matchups (1v1, 2v2, 2v3, 1v3) across Random, Heuristic, and RL bots."""
     learner_model.eval()
     if opponent_model:
       opponent_model.eval()
@@ -173,11 +175,8 @@ class SelfPlayPool:
     np.random.seed(eval_seed)
     torch.manual_seed(eval_seed)
 
-    wins = 0
-    losses = 0
-    draws = 0
-    total_scored = 0
-    total_conceded = 0
+    wins, losses, draws = 0, 0, 0
+    total_scored, total_conceded = 0, 0
     ep_rewards = []
 
     _ego_dirs = [
@@ -205,11 +204,15 @@ class SelfPlayPool:
     heur_ctrl_red = HeuristicBotController(heur_coord_red)
     heur_ctrl_blue = HeuristicBotController(heur_coord_blue)
 
+    # Defaults to symmetric matchup if opp_team_size is omitted (Stage 1 compatible)
+    l_size = team_size
+    o_size = opp_team_size if opp_team_size is not None else team_size
+
     def apply_eval_restart(sim, ep_idx: int, is_initial: bool = False):
+      """Universal asymmetric squad positioner with multi-lane defensive depth."""
       p = sim.pitch
       safe_m = 50.0
 
-      # 1. Determine Ball & Lead Duelist Coordinates
       if (ep_idx % 5 == 0) and is_initial:
         bx, by = sim.center.x, sim.center.y
         dist = min(140.0, p.width * 0.16)
@@ -232,69 +235,73 @@ class SelfPlayPool:
       rx_lead, ry_lead = bx - vx, by - vy
       bx_lead, by_lead = bx + vx, by + vy
 
-      # 2. Position All Red Players with Tactical Staggering
+      # Stagger Red Squad across defensive lanes
       for idx, pl in enumerate(sim.red_team):
         if idx == 0:
           px = max(p.left + safe_m, min(p.right - safe_m, rx_lead))
           py = max(p.top + safe_m, min(p.bottom - safe_m, ry_lead))
         else:
-          back_offset = min(240.0, max(120.0, (rx_lead - p.left) * 0.45))
+          back_offset = min(
+              240.0, max(100.0, (rx_lead - p.left) * 0.40)
+          ) * (1.0 + (idx - 1) * 0.4)
           px = max(p.left + safe_m, rx_lead - back_offset)
           lane_sign = 1.0 if (idx % 2 == 1) else -1.0
+          y_offset = lane_sign * (65.0 + (idx // 2) * 55.0)
           py = min(
-              max(p.top + safe_m, sim.center.y + (lane_sign * 90.0)),
+              max(p.top + safe_m, sim.center.y + y_offset),
               p.bottom - safe_m,
           )
         pl.pos = Vec2(px, py)
         pl.vel = Vec2(0.0, 0.0)
         pl.kick_cooldown_timer = 0.0
 
-      # 3. Position All Blue Players with Tactical Staggering
+      # Stagger Blue Squad across defensive lanes
       for idx, pl in enumerate(sim.blue_team):
         if idx == 0:
           px = max(p.left + safe_m, min(p.right - safe_m, bx_lead))
           py = max(p.top + safe_m, min(p.bottom - safe_m, by_lead))
         else:
-          back_offset = min(240.0, max(120.0, (p.right - bx_lead) * 0.45))
+          back_offset = min(
+              240.0, max(100.0, (p.right - bx_lead) * 0.40)
+          ) * (1.0 + (idx - 1) * 0.4)
           px = min(p.right - safe_m, bx_lead + back_offset)
           lane_sign = -1.0 if (idx % 2 == 1) else 1.0
+          y_offset = lane_sign * (65.0 + (idx // 2) * 55.0)
           py = min(
-              max(p.top + safe_m, sim.center.y + (lane_sign * 90.0)),
+              max(p.top + safe_m, sim.center.y + y_offset),
               p.bottom - safe_m,
           )
         pl.pos = Vec2(px, py)
         pl.vel = Vec2(0.0, 0.0)
         pl.kick_cooldown_timer = 0.0
 
-      # 4. Neutralize Match Mode State
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
         if hasattr(sim.mode, "celebration_timer"):
           sim.mode.celebration_timer = 0.0
-
 
     for ep in range(num_episodes):
       learner_team = "red" if ep % 2 == 0 else "blue"
       opp_team = "blue" if learner_team == "red" else "red"
       sign = 1.0 if learner_team == "red" else -1.0
 
-      learner_placeholders = [LocalPlaceholder() for _ in range(team_size)]
-      opp_placeholders = [LocalPlaceholder() for _ in range(team_size)]
+      learner_placeholders = [LocalPlaceholder() for _ in range(l_size)]
+      opp_placeholders = [LocalPlaceholder() for _ in range(o_size)]
 
       roster = []
-      for i in range(team_size):
+      for i in range(l_size):
         roster.append(
             PlayerSlot(
                 learner_team,
-                PlayerStats(f"L{i}", accel=3200.0),
+                PlayerStats(f"L{i+1}", accel=3200.0),
                 learner_placeholders[i],
             )
         )
-      for j in range(team_size):
+      for j in range(o_size):
         roster.append(
             PlayerSlot(
                 opp_team,
-                PlayerStats(f"O{j}", accel=3200.0),
+                PlayerStats(f"O{j+1}", accel=3200.0),
                 opp_placeholders[j],
             )
         )
@@ -308,7 +315,6 @@ class SelfPlayPool:
       )
       sim = Simulation(match_config=cfg, goal_height=goal_height)
 
-      # ── DISABLE INTERNAL MODE RESETS ──
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
         if hasattr(sim.mode, "reset_positions"):
@@ -323,9 +329,8 @@ class SelfPlayPool:
       ep_rew = 0.0
       action_repeat = 4
 
-      # Full continuous match duration loop
       while physics_steps < max_steps:
-        # 1. Update Learner Action (15 Hz)
+        # 1. Update Learner Actions (15 Hz)
         l_squad = sim.red_team if learner_team == "red" else sim.blue_team
         for idx, player in enumerate(l_squad):
           obs = extract_actor_obs(sim, player, learner_team)
@@ -343,10 +348,9 @@ class SelfPlayPool:
               bool(act[0, 1].item()),
           )
 
-        # 2. Update Opponent Action (15 Hz)
+        # 2. Update Opponent Actions (15 Hz - Supports Random, Heuristic, and RL Models)
         o_squad = sim.blue_team if learner_team == "red" else sim.red_team
         for idx, opp_player in enumerate(o_squad):
-          # Query using true global index in sim.all_players
           global_idx = sim.all_players.index(opp_player)
 
           if opponent_type == "heuristic":
@@ -375,7 +379,7 @@ class SelfPlayPool:
                 random.random() < 0.20,
             )
 
-        # 3. Advance Physics (Accumulate scores continuously)
+        # 3. Physics Substeps
         for _ in range(action_repeat):
           physics_steps += 1
           goal = sim.step(1.0 / 60.0)
@@ -386,14 +390,12 @@ class SelfPlayPool:
           if goal is not None:
             scored = goal == f"{learner_team}_goal"
             ep_rew += 1.0 if scored else -1.0
-
             apply_eval_restart(sim, ep_idx=ep, is_initial=False)
             break
 
           if physics_steps >= max_steps:
             break
 
-      # Final Whistle Evaluation Scoring
       scored = sim.score_red if learner_team == "red" else sim.score_blue
       conceded = sim.score_blue if learner_team == "red" else sim.score_red
       diff = scored - conceded
@@ -405,7 +407,7 @@ class SelfPlayPool:
         ep_rew -= 1.0 + 0.1 * abs(diff)
         losses += 1
       else:
-        ep_rew -= 1.0
+        ep_rew -= 0.5
         draws += 1
 
       total_scored += scored
@@ -442,15 +444,21 @@ class SelfPlayPool:
       target_tier: str = "champion",
       filter_thresholds: dict[str, float] | None = None,
       team_size: int = 1,
+      opp_team_size: int | None = None,
       goal_height: float | None = None,
       pitch_width: float = 1200.0,
       pitch_height: float = 800.0,
       num_episodes: int = 40,
-      max_steps: int = 1800,
+      max_steps: int = 2700,
       device: torch.device = torch.device("cpu"),
   ) -> tuple[bool, dict, tuple]:
+    """Runs qualification filters across active tiers supporting custom opponent team sizes."""
     results = {}
     filters = filter_thresholds or {}
+
+    effective_opp_size = (
+        opp_team_size if opp_team_size is not None else team_size
+    )
 
     # 1. Tier: Random Bot
     if "random" in active_tiers:
@@ -458,6 +466,7 @@ class SelfPlayPool:
           learner_model,
           opponent_type="random",
           team_size=team_size,
+          opp_team_size=effective_opp_size,
           goal_height=goal_height,
           pitch_width=pitch_width,
           pitch_height=pitch_height,
@@ -465,7 +474,10 @@ class SelfPlayPool:
           num_episodes=num_episodes,
           max_steps=max_steps,
       )
-      if "random" in filters and results["random"]["win_rate"] < filters["random"]:
+      if (
+          "random" in filters
+          and results["random"]["win_rate"] < filters["random"]
+      ):
         return False, results, self.best_score
 
     # 2. Tier: Heuristic Bot
@@ -474,6 +486,7 @@ class SelfPlayPool:
           learner_model,
           opponent_type="heuristic",
           team_size=team_size,
+          opp_team_size=effective_opp_size,
           goal_height=goal_height,
           pitch_width=pitch_width,
           pitch_height=pitch_height,
@@ -481,10 +494,13 @@ class SelfPlayPool:
           num_episodes=num_episodes,
           max_steps=max_steps,
       )
-      if "heuristic" in filters and results["heuristic"]["win_rate"] < filters["heuristic"]:
+      if (
+          "heuristic" in filters
+          and results["heuristic"]["win_rate"] < filters["heuristic"]
+      ):
         return False, results, self.best_score
 
-    # 3. Tier: Champion
+    # 3. Tier: Champion (Self-Play)
     if "champion" in active_tiers:
       if os.path.exists(self.champion_path):
         champ = ActorCritic().to(device)
@@ -504,6 +520,7 @@ class SelfPlayPool:
             opponent_type="model",
             opponent_model=champ,
             team_size=team_size,
+            opp_team_size=effective_opp_size,
             goal_height=goal_height,
             pitch_width=pitch_width,
             pitch_height=pitch_height,
@@ -519,15 +536,17 @@ class SelfPlayPool:
             "score_tuple": (1.0, 1.0, 1),
         }
 
-      if "champion" in filters and results["champion"]["win_rate"] < filters["champion"]:
+      if (
+          "champion" in filters
+          and results["champion"]["win_rate"] < filters["champion"]
+      ):
         return False, results, self.best_score
 
-    # 4. Strict Promotion Gating
+    # 4. Promotion Criteria
     cand = results[target_tier]
     cand_score = cand["score_tuple"]
 
     if target_tier == "champion":
-      # Enforces strict 35%+ win rate and +5 net goal differential
       is_promoted = cand["win_rate"] >= 0.35 and cand["net"] >= 5
       return is_promoted, results, cand_score
 
