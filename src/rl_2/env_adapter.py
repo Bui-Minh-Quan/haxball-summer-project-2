@@ -60,10 +60,13 @@ class MatchEnv(gym.Env):
       opp_team_size: int | None = None,
       learner_team: str = "red",
       max_round_steps: int = 3600,  # 60s at 60 Hz physics
+      action_repeat: int = 10,
       goal_height: float | None = None,
       opponent_controller: Controller | None = None,
       pitch_width: float = 1200.0,
       pitch_height: float = 800.0,
+      heuristic_accel: float = 3200.0,  
+      heuristic_kick: float = 1200.0,
   ):
     super().__init__()
     self.learner_team_size = learner_team_size or team_size
@@ -73,10 +76,13 @@ class MatchEnv(gym.Env):
     self.learner_team = learner_team
     self.opp_team = "blue" if learner_team == "red" else "red"
     self.max_round_steps = max_round_steps
+    self.action_repeat = action_repeat
     self.goal_height = goal_height
     self.pitch_width = pitch_width
     self.pitch_height = pitch_height
     self.opponent_controller = opponent_controller or RandomOpponentController()
+    self.heuristic_accel = heuristic_accel
+    self.heuristic_kick = heuristic_kick
 
     self._ego_dirs = [
         (0.0, 0.0),   # 0: None
@@ -260,6 +266,17 @@ class MatchEnv(gym.Env):
     if hasattr(self.opponent_controller, "reset_opponent"):
       self.opponent_controller.reset_opponent()
 
+    # Dynamic Stat Buffing: Heuristic gets buffed, Self-Play stays standard (3200 / 1200)
+    mode = getattr(self.opponent_controller, "current_mode", "heuristic")
+    is_heuristic = (mode == "heuristic")
+    target_accel = self.heuristic_accel if is_heuristic else 3200.0
+    target_kick = self.heuristic_kick if is_heuristic else 1200.0
+
+    opp_team = self.sim.blue_team if self.learner_team == "red" else self.sim.red_team
+    for player in opp_team:
+      player.stats.accel = target_accel
+      player.stats.kick_strength = target_kick
+
     if hasattr(self.sim.mode, "time_remaining"):
       self.sim.mode.time_remaining = self.match_time_remaining
       self.sim.mode.state = "PLAYING"
@@ -269,7 +286,7 @@ class MatchEnv(gym.Env):
 
   def step(self, action):
     dt = 1.0 / 60.0
-    action_repeat = 10
+    action_repeat = self.action_repeat
 
     # 1. Update Learner Actions (15 Hz)
     sign = 1.0 if self.learner_team == "red" else -1.0
