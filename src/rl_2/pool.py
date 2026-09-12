@@ -389,7 +389,7 @@ class SelfPlayPool:
 
           if goal is not None:
             scored = goal == f"{learner_team}_goal"
-            ep_rew += 1.0 if scored else -1.0
+            ep_rew += 1.5 if scored else -1.0
             apply_eval_restart(sim, ep_idx=ep, is_initial=False)
             break
 
@@ -547,7 +547,7 @@ class SelfPlayPool:
     cand_score = cand["score_tuple"]
 
     if target_tier == "champion":
-      is_promoted = cand["win_rate"] >= 0.35 and cand["net"] >= 5
+      is_promoted = cand["win_rate"] >= 0.30 and cand["net"] >= 5
       return is_promoted, results, cand_score
 
     if cand_score > self.best_score:
