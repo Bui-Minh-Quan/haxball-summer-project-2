@@ -5,14 +5,84 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from src.rl_2.model import ActorCritic
-from src.rl_2.obs import ACTOR_OBS_DIM, CRITIC_STATE_DIM
-from src.rl_2.pool import SelfPlayPool
+from src.rl_transformer.entity_obs import (
+    BALL_DIM,
+    EGO_DIM,
+    MAX_OPPONENTS,
+    MAX_TEAMMATES,
+    PLAYER_DIM,
+    TOTAL_TOKENS,
+)
+from src.rl_transformer.pool import SelfPlayPool
+from src.rl_transformer.transformer_model import TransformerActorCritic
+
+
+def _unpack_and_tensorize_obs(payload: dict[str, np.ndarray], team_size: int, device: torch.device):
+  """Flattens parallel environment dictionaries into contiguous PyTorch tensors."""
+  if team_size == 1:
+    act_ego = torch.as_tensor(payload["actor_ego"], dtype=torch.float32, device=device)
+    act_ball = torch.as_tensor(payload["actor_ball"], dtype=torch.float32, device=device)
+    act_mates = torch.as_tensor(payload["actor_teammates"], dtype=torch.float32, device=device)
+    act_opps = torch.as_tensor(payload["actor_opponents"], dtype=torch.float32, device=device)
+    act_mask = torch.as_tensor(payload["actor_mask"], dtype=torch.bool, device=device)
+
+    crit_ball = torch.as_tensor(payload["critic_ball"], dtype=torch.float32, device=device)
+    crit_learners = torch.as_tensor(payload["critic_learners"], dtype=torch.float32, device=device)
+    crit_opps = torch.as_tensor(payload["critic_opponents"], dtype=torch.float32, device=device)
+    crit_mask = torch.as_tensor(payload["critic_mask"], dtype=torch.bool, device=device)
+  else:
+    act_ego = torch.as_tensor(
+        payload["actor_ego"].reshape(-1, EGO_DIM), dtype=torch.float32, device=device
+    )
+    act_ball = torch.as_tensor(
+        payload["actor_ball"].reshape(-1, BALL_DIM), dtype=torch.float32, device=device
+    )
+    act_mates = torch.as_tensor(
+        payload["actor_teammates"].reshape(-1, MAX_TEAMMATES, PLAYER_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    act_opps = torch.as_tensor(
+        payload["actor_opponents"].reshape(-1, MAX_OPPONENTS, PLAYER_DIM),
+        dtype=torch.float32,
+        device=device,
+    )
+    act_mask = torch.as_tensor(
+        payload["actor_mask"].reshape(-1, TOTAL_TOKENS), dtype=torch.bool, device=device
+    )
+
+    crit_ball = torch.as_tensor(
+        np.repeat(payload["critic_ball"], team_size, axis=0), dtype=torch.float32, device=device
+    )
+    crit_learners = torch.as_tensor(
+        np.repeat(payload["critic_learners"], team_size, axis=0), dtype=torch.float32, device=device
+    )
+    crit_opps = torch.as_tensor(
+        np.repeat(payload["critic_opponents"], team_size, axis=0), dtype=torch.float32, device=device
+    )
+    crit_mask = torch.as_tensor(
+        np.repeat(payload["critic_mask"], team_size, axis=0), dtype=torch.bool, device=device
+    )
+
+  actor_obs = {
+      "ego": act_ego,
+      "ball": act_ball,
+      "teammates": act_mates,
+      "opponents": act_opps,
+      "key_padding_mask": act_mask,
+  }
+  critic_obs = {
+      "ball": crit_ball,
+      "learners": crit_learners,
+      "opponents": crit_opps,
+      "key_padding_mask": crit_mask,
+  }
+  return actor_obs, critic_obs
 
 
 def train_mappo(
     envs,
-    model: ActorCritic,
+    model: TransformerActorCritic,
     device: torch.device,
     team_size: int = 3,
     opp_team_size: int | None = None,
@@ -20,10 +90,10 @@ def train_mappo(
     num_envs: int = 16,
     num_steps: int = 256,
     update_epochs: int = 3,
-    minibatch_size: int = 1536,
-    lr_init: float = 4e-5,
+    minibatch_size: int = 1024,
+    lr_init: float = 3e-5,
     lr_final: float = 2e-6,
-    ent_coef_init: float = 0.007,
+    ent_coef_init: float = 0.008,
     ent_coef_final: float = 0.0008,
     gamma: float = 0.995,
     gae_lambda: float = 0.97,
@@ -31,20 +101,20 @@ def train_mappo(
     vf_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     eval_freq: int = 250_000,
-    eval_episodes: int | dict[str, int] = 50,
+    eval_episodes: int | dict[str, int] = 35,
     tier_ratios: dict[str, float] | None = None,
     active_tiers: list[str] | None = None,
     target_tier: str = "champion",
     filter_thresholds: dict[str, float] | None = None,
     goal_height: float | None = None,
-    save_dir: str = "models/stage3/phase2",
+    save_dir: str = "models/stage3_transformer",
     pool_dir: str | None = None,
     pitch_width: float = 1200.0,
     pitch_height: float = 800.0,
     max_steps: int = 3600,
     action_repeat: int = 10,
 ):
-  """Accelerated MAPPO with CUDA Mixed Precision and Vectorized Evaluation."""
+  """Accelerated Multi-Agent PPO optimized for Entity-Transformer Architectures."""
   os.makedirs(save_dir, exist_ok=True)
   effective_pool_dir = pool_dir or os.path.join(save_dir, "pool")
   pool = SelfPlayPool(effective_pool_dir)
@@ -56,8 +126,18 @@ def train_mappo(
   n_agents_step = num_envs * team_size
   batch_size = num_steps * n_agents_step
 
-  obs_buf = torch.zeros((num_steps, n_agents_step, ACTOR_OBS_DIM), device=device)
-  state_buf = torch.zeros((num_steps, n_agents_step, CRITIC_STATE_DIM), device=device)
+  # ── Preallocated Entity Buffers ──
+  buf_actor_ego = torch.zeros((num_steps, n_agents_step, EGO_DIM), device=device)
+  buf_actor_ball = torch.zeros((num_steps, n_agents_step, BALL_DIM), device=device)
+  buf_actor_mates = torch.zeros((num_steps, n_agents_step, MAX_TEAMMATES, PLAYER_DIM), device=device)
+  buf_actor_opps = torch.zeros((num_steps, n_agents_step, MAX_OPPONENTS, PLAYER_DIM), device=device)
+  buf_actor_mask = torch.zeros((num_steps, n_agents_step, TOTAL_TOKENS), dtype=torch.bool, device=device)
+
+  buf_critic_ball = torch.zeros((num_steps, n_agents_step, BALL_DIM), device=device)
+  buf_critic_learners = torch.zeros((num_steps, n_agents_step, 3, PLAYER_DIM), device=device)
+  buf_critic_opps = torch.zeros((num_steps, n_agents_step, 3, PLAYER_DIM), device=device)
+  buf_critic_mask = torch.zeros((num_steps, n_agents_step, 7), dtype=torch.bool, device=device)
+
   actions_buf = torch.zeros((num_steps, n_agents_step, 2), device=device)
   logprobs_buf = torch.zeros((num_steps, n_agents_step), device=device)
   rewards_buf = torch.zeros((num_steps, n_agents_step), device=device)
@@ -65,20 +145,7 @@ def train_mappo(
   values_buf = torch.zeros((num_steps, n_agents_step), device=device)
 
   next_payload, _ = envs.reset()
-  next_obs_np = next_payload["obs"]
-  next_state_np = next_payload["state"]
-
-  if team_size == 1:
-    next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
-    next_state = torch.as_tensor(next_state_np, dtype=torch.float32, device=device)
-  else:
-    next_obs = torch.as_tensor(
-        next_obs_np.reshape(-1, ACTOR_OBS_DIM), dtype=torch.float32, device=device
-    )
-    next_state = torch.as_tensor(
-        np.repeat(next_state_np, team_size, axis=0), dtype=torch.float32, device=device
-    )
-
+  next_actor_obs, next_critic_obs = _unpack_and_tensorize_obs(next_payload, team_size, device)
   next_done = torch.zeros(n_agents_step, device=device)
 
   global_step = 0
@@ -87,7 +154,7 @@ def train_mappo(
   interval_steps = 0
 
   print(
-      f"🚀 Accelerated MAPPO Initialized | Format: {team_size}v{opp_team_size or team_size} | "
+      f"🚀 Entity-Transformer MAPPO Initialized | Format: {team_size}v{opp_team_size or team_size} | "
       f"Envs: {num_envs} | Batch: {batch_size} | Device: {device}"
   )
 
@@ -98,17 +165,27 @@ def train_mappo(
     for param_group in optimizer.param_groups:
       param_group["lr"] = curr_lr
 
-    # ── Rollout Collection (Zero-overhead Inference Mode) ──
+    # ── 1. Rollout Collection ──
     for step in range(num_steps):
       global_step += n_agents_step
       interval_steps += n_agents_step
 
-      obs_buf[step] = next_obs
-      state_buf[step] = next_state
+      buf_actor_ego[step] = next_actor_obs["ego"]
+      buf_actor_ball[step] = next_actor_obs["ball"]
+      buf_actor_mates[step] = next_actor_obs["teammates"]
+      buf_actor_opps[step] = next_actor_obs["opponents"]
+      buf_actor_mask[step] = next_actor_obs["key_padding_mask"]
+
+      buf_critic_ball[step] = next_critic_obs["ball"]
+      buf_critic_learners[step] = next_critic_obs["learners"]
+      buf_critic_opps[step] = next_critic_obs["opponents"]
+      buf_critic_mask[step] = next_critic_obs["key_padding_mask"]
       dones_buf[step] = next_done
 
       with torch.inference_mode():
-        action, logprob, _, value = model.get_action_and_value(next_obs, state=next_state)
+        action, logprob, _, value = model.get_action_and_value(
+            actor_obs=next_actor_obs, critic_obs=next_critic_obs
+        )
         values_buf[step] = value.flatten()
 
       actions_buf[step] = action
@@ -118,34 +195,20 @@ def train_mappo(
       env_action = action_np if team_size == 1 else action_np.reshape(num_envs, team_size, 2)
 
       next_payload, reward_np, terms, truncs, _ = envs.step(env_action)
-      next_obs_np = next_payload["obs"]
-      next_state_np = next_payload["state"]
       next_dones_np = np.logical_or(terms, truncs)
 
       if team_size > 1 and reward_np.size == num_envs:
         reward_np = np.repeat(reward_np, team_size)
         next_dones_np = np.repeat(next_dones_np, team_size)
 
-      rewards_buf[step] = torch.as_tensor(
-          reward_np.flatten(), dtype=torch.float32, device=device
-      )
-
-      if team_size == 1:
-        next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
-        next_state = torch.as_tensor(next_state_np, dtype=torch.float32, device=device)
-      else:
-        next_obs = torch.as_tensor(
-            next_obs_np.reshape(-1, ACTOR_OBS_DIM), dtype=torch.float32, device=device
-        )
-        next_state = torch.as_tensor(
-            np.repeat(next_state_np, team_size, axis=0), dtype=torch.float32, device=device
-        )
-
+      rewards_buf[step] = torch.as_tensor(reward_np.flatten(), dtype=torch.float32, device=device)
       next_done = torch.as_tensor(next_dones_np.flatten(), dtype=torch.float32, device=device)
 
-    # ── GAE ──
+      next_actor_obs, next_critic_obs = _unpack_and_tensorize_obs(next_payload, team_size, device)
+
+    # ── 2. Generalized Advantage Estimation (GAE) ──
     with torch.inference_mode():
-      next_value = model.get_value(next_state)
+      next_value = model.get_value(next_critic_obs)
       advantages = torch.zeros_like(rewards_buf, device=device)
       lastgaelam = 0.0
 
@@ -162,11 +225,20 @@ def train_mappo(
 
       returns = advantages + values_buf
 
-    # ── AMP Minibatch Optimization ──
-    b_obs = obs_buf.reshape((-1, ACTOR_OBS_DIM))
-    b_states = state_buf.reshape((-1, CRITIC_STATE_DIM))
+    # ── 3. Minibatch Entity Optimization ──
+    b_actor_ego = buf_actor_ego.reshape(-1, EGO_DIM)
+    b_actor_ball = buf_actor_ball.reshape(-1, BALL_DIM)
+    b_actor_mates = buf_actor_mates.reshape(-1, MAX_TEAMMATES, PLAYER_DIM)
+    b_actor_opps = buf_actor_opps.reshape(-1, MAX_OPPONENTS, PLAYER_DIM)
+    b_actor_mask = buf_actor_mask.reshape(-1, TOTAL_TOKENS)
+
+    b_critic_ball = buf_critic_ball.reshape(-1, BALL_DIM)
+    b_critic_learners = buf_critic_learners.reshape(-1, 3, PLAYER_DIM)
+    b_critic_opps = buf_critic_opps.reshape(-1, 3, PLAYER_DIM)
+    b_critic_mask = buf_critic_mask.reshape(-1, 7)
+
+    b_actions = actions_buf.reshape(-1, 2)
     b_logprobs = logprobs_buf.reshape(-1)
-    b_actions = actions_buf.reshape((-1, 2))
     b_advantages = advantages.reshape(-1)
     b_returns = returns.reshape(-1)
 
@@ -184,10 +256,24 @@ def train_mappo(
         end = start + minibatch_size
         mb_idx = b_indices[start:end]
 
+        mb_actor_obs = {
+            "ego": b_actor_ego[mb_idx],
+            "ball": b_actor_ball[mb_idx],
+            "teammates": b_actor_mates[mb_idx],
+            "opponents": b_actor_opps[mb_idx],
+            "key_padding_mask": b_actor_mask[mb_idx],
+        }
+        mb_critic_obs = {
+            "ball": b_critic_ball[mb_idx],
+            "learners": b_critic_learners[mb_idx],
+            "opponents": b_critic_opps[mb_idx],
+            "key_padding_mask": b_critic_mask[mb_idx],
+        }
+
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
           _, newlogprob, entropy, newvalue = model.get_action_and_value(
-              b_obs[mb_idx],
-              state=b_states[mb_idx],
+              actor_obs=mb_actor_obs,
+              critic_obs=mb_critic_obs,
               action=b_actions[mb_idx],
           )
 
@@ -211,7 +297,7 @@ def train_mappo(
     if pool:
       pool.save_latest(model)
 
-    # ── Fast Evaluation ──
+    # ── 4. Fast Lockstep Evaluation ──
     if global_step >= next_eval_step:
       next_eval_step += eval_freq
       interval_sps = int(interval_steps / max(1e-3, (time.time() - interval_start_time)))

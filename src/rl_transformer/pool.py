@@ -12,13 +12,13 @@ from src.engine.controllers import Controller, HeuristicBotController
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
-from src.rl_2.env_adapter import RandomOpponentController
-from src.rl_2.model import ActorCritic
-from src.rl_2.obs import extract_actor_obs
+from src.rl_transformer.entity_obs import extract_entity_obs
+from src.rl_transformer.env_adapter import RandomOpponentController
+from src.rl_transformer.transformer_model import TransformerActorCritic
 
 
 class PoolOpponentController(Controller):
-  """Dynamic opponent controller sampling across Random, Heuristic, and Self-Play models."""
+  """Samples opponents across Random, Heuristic, and Historical Transformer models."""
 
   def __init__(
       self,
@@ -26,7 +26,7 @@ class PoolOpponentController(Controller):
       team: str = "blue",
       device: str = "cpu",
       p_random: float = 0.05,
-      p_heuristic: float = 0.45,
+      p_heuristic: float = 0.40,
   ):
     torch.set_num_threads(1)
     self.pool_dir = pool_dir
@@ -41,7 +41,7 @@ class PoolOpponentController(Controller):
     self.heuristic_ctrl = HeuristicBotController(
         TeamHeuristicCoordinator(team=team)
     )
-    self.model = ActorCritic().to(self.device)
+    self.model = TransformerActorCritic().to(self.device)
     self.model.eval()
 
     self.current_mode = "random"
@@ -54,11 +54,7 @@ class PoolOpponentController(Controller):
   def reset_opponent(self):
     roll = random.random()
 
-    if (
-        roll < self.p_random
-        or not self.pool_dir
-        or not os.path.exists(self.pool_dir)
-    ):
+    if roll < self.p_random or not self.pool_dir or not os.path.exists(self.pool_dir):
       self.current_mode = "random"
       return
 
@@ -83,8 +79,7 @@ class PoolOpponentController(Controller):
             if isinstance(ckpt, dict) and "model_state_dict" in ckpt
             else ckpt
         )
-        actor_dict = {k: v for k, v in state_dict.items() if not k.startswith("critic")}
-        self.model.load_state_dict(actor_dict, strict=False)
+        self.model.load_state_dict(state_dict, strict=False)
         self.current_mode = "model"
         return
       except Exception:
@@ -99,11 +94,18 @@ class PoolOpponentController(Controller):
       return self.heuristic_ctrl.get_action(player_idx, sim)
 
     player = sim.all_players[player_idx]
-    obs = extract_actor_obs(sim, player, self.team)
-    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+    obs = extract_entity_obs(sim, player, self.team)
+
+    actor_obs = {
+        "ego": torch.as_tensor(obs["ego"], dtype=torch.float32, device=self.device).unsqueeze(0),
+        "ball": torch.as_tensor(obs["ball"], dtype=torch.float32, device=self.device).unsqueeze(0),
+        "teammates": torch.as_tensor(obs["teammates"], dtype=torch.float32, device=self.device).unsqueeze(0),
+        "opponents": torch.as_tensor(obs["opponents"], dtype=torch.float32, device=self.device).unsqueeze(0),
+        "key_padding_mask": torch.as_tensor(obs["key_padding_mask"], dtype=torch.bool, device=self.device).unsqueeze(0),
+    }
 
     with torch.inference_mode():
-      action, _, _, _ = self.model.get_action_and_value(obs_tensor, deterministic=True)
+      action, _, _, _ = self.model.get_action_and_value(actor_obs, deterministic=True)
 
     m_idx = int(action[0, 0].item())
     kick = bool(action[0, 1].item())
@@ -112,7 +114,7 @@ class PoolOpponentController(Controller):
 
 
 class SelfPlayPool:
-  """Manages snapshots, champions, and high-throughput batched evaluations."""
+  """Manages model checkpoints and high-throughput batched evaluations for Entity Transformers."""
 
   def __init__(self, pool_dir: str):
     self.pool_dir = pool_dir
@@ -134,7 +136,7 @@ class SelfPlayPool:
       learner_model: nn.Module,
       opponent_type: str,
       opponent_model: nn.Module | None = None,
-      num_episodes: int = 40,
+      num_episodes: int = 35,
       team_size: int = 3,
       opp_team_size: int | None = None,
       goal_height: float | None = None,
@@ -145,7 +147,6 @@ class SelfPlayPool:
       device: torch.device = torch.device("cpu"),
       eval_seed: int = 42,
   ) -> dict:
-    """High-throughput lockstep evaluation running all matches concurrently with batched GPU inference."""
     learner_model.eval()
     if opponent_model:
       opponent_model.eval()
@@ -231,7 +232,7 @@ class SelfPlayPool:
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
 
-    # 1. Instantiate all simulation matches simultaneously
+    # 1. Instantiate all matches concurrently
     sims = []
     learner_phs = []
     opp_phs = []
@@ -276,22 +277,33 @@ class SelfPlayPool:
 
     total_decisions = max_steps // action_repeat
 
-    # 2. Batched lockstep progression (all episodes step concurrently)
+    # 2. Batched Lockstep Loop
     for dec in range(total_decisions):
-      # Extract observations for all learner agents across all active matches
-      obs_l = []
+      # Extract entity tokens for all learner agents across all active matches
+      l_egos, l_balls, l_mates, l_opps, l_masks = [], [], [], [], []
       for ep in range(num_episodes):
         sim = sims[ep]
         squad = sim.red_team if learner_teams[ep] == "red" else sim.blue_team
         for pl in squad:
-          obs_l.append(extract_actor_obs(sim, pl, learner_teams[ep]))
+          tokens = extract_entity_obs(sim, pl, learner_teams[ep])
+          l_egos.append(tokens["ego"])
+          l_balls.append(tokens["ball"])
+          l_mates.append(tokens["teammates"])
+          l_opps.append(tokens["opponents"])
+          l_masks.append(tokens["key_padding_mask"])
 
-      obs_l_t = torch.as_tensor(np.array(obs_l, dtype=np.float32), device=device)
+      learner_batch = {
+          "ego": torch.as_tensor(np.stack(l_egos), dtype=torch.float32, device=device),
+          "ball": torch.as_tensor(np.stack(l_balls), dtype=torch.float32, device=device),
+          "teammates": torch.as_tensor(np.stack(l_mates), dtype=torch.float32, device=device),
+          "opponents": torch.as_tensor(np.stack(l_opps), dtype=torch.float32, device=device),
+          "key_padding_mask": torch.as_tensor(np.stack(l_masks), dtype=torch.bool, device=device),
+      }
+
       with torch.inference_mode():
-        acts_l, _, _, _ = learner_model.get_action_and_value(obs_l_t, deterministic=True)
+        acts_l, _, _, _ = learner_model.get_action_and_value(learner_batch, deterministic=True)
       acts_l_np = acts_l.cpu().numpy()
 
-      # Assign learner actions
       cursor_l = 0
       for ep in range(num_episodes):
         sign = signs[ep]
@@ -302,18 +314,30 @@ class SelfPlayPool:
           learner_phs[ep][pl_idx].action = (Vec2(ex * sign, ey), k_val)
           cursor_l += 1
 
-      # Handle opponent actions
+      # Opponents action evaluation
       if opponent_type == "model" and opponent_model is not None:
-        obs_o = []
+        o_egos, o_balls, o_mates, o_opps, o_masks = [], [], [], [], []
         for ep in range(num_episodes):
           sim = sims[ep]
           squad = sim.blue_team if learner_teams[ep] == "red" else sim.red_team
           for pl in squad:
-            obs_o.append(extract_actor_obs(sim, pl, opp_teams[ep]))
+            tokens = extract_entity_obs(sim, pl, opp_teams[ep])
+            o_egos.append(tokens["ego"])
+            o_balls.append(tokens["ball"])
+            o_mates.append(tokens["teammates"])
+            o_opps.append(tokens["opponents"])
+            o_masks.append(tokens["key_padding_mask"])
 
-        obs_o_t = torch.as_tensor(np.array(obs_o, dtype=np.float32), device=device)
+        opp_batch = {
+            "ego": torch.as_tensor(np.stack(o_egos), dtype=torch.float32, device=device),
+            "ball": torch.as_tensor(np.stack(o_balls), dtype=torch.float32, device=device),
+            "teammates": torch.as_tensor(np.stack(o_mates), dtype=torch.float32, device=device),
+            "opponents": torch.as_tensor(np.stack(o_opps), dtype=torch.float32, device=device),
+            "key_padding_mask": torch.as_tensor(np.stack(o_masks), dtype=torch.bool, device=device),
+        }
+
         with torch.inference_mode():
-          acts_o, _, _, _ = opponent_model.get_action_and_value(obs_o_t, deterministic=True)
+          acts_o, _, _, _ = opponent_model.get_action_and_value(opp_batch, deterministic=True)
         acts_o_np = acts_o.cpu().numpy()
 
         cursor_o = 0
@@ -334,14 +358,13 @@ class SelfPlayPool:
           for pl_idx, opp_pl in enumerate(squad):
             g_idx = sim.all_players.index(opp_pl)
             opp_phs[ep][pl_idx].action = bot.get_action(g_idx, sim)
-
       else:
         for ep in range(num_episodes):
           for pl_idx in range(o_size):
             dx, dy = random.choice(_ego_dirs)
             opp_phs[ep][pl_idx].action = (Vec2(dx, dy), random.random() < 0.20)
 
-      # Step all matches forward
+      # Step simulations
       for _ in range(action_repeat):
         for ep in range(num_episodes):
           sim = sims[ep]
@@ -353,7 +376,7 @@ class SelfPlayPool:
             ep_rewards[ep] += 1.0 if scored else -1.0
             apply_eval_restart(sim, ep_idx=ep, is_initial=False)
 
-    # 3. Aggregate results across episodes
+    # 3. Aggregate metrics
     wins, losses, draws = 0, 0, 0
     total_scored, total_conceded = 0, 0
 
@@ -411,18 +434,16 @@ class SelfPlayPool:
       goal_height: float | None = None,
       pitch_width: float = 1200.0,
       pitch_height: float = 800.0,
-      num_episodes: int | dict[str, int] = 40,
+      num_episodes: int | dict[str, int] = 35,
       tier_ratios: dict[str, float] | None = None,
       action_repeat: int = 10,
       max_steps: int = 3600,
       device: torch.device = torch.device("cpu"),
   ) -> tuple[bool, dict, tuple]:
-    """Runs qualification filters across active tiers with budgeted episodes per tier."""
     results = {}
     filters = filter_thresholds or {}
     effective_opp_size = opp_team_size if opp_team_size is not None else team_size
 
-    # Budget episodes across tiers
     tier_ep_counts: dict[str, int] = {}
     if isinstance(num_episodes, dict):
       tier_ep_counts = num_episodes
@@ -434,7 +455,7 @@ class SelfPlayPool:
       for t in active_tiers:
         tier_ep_counts[t] = num_episodes
 
-    # 1. Tier: Random Bot
+    # Tier 1: Random Bot
     if "random" in active_tiers:
       eps = tier_ep_counts.get("random", 10)
       results["random"] = self.evaluate_matchup(
@@ -453,7 +474,7 @@ class SelfPlayPool:
       if "random" in filters and results["random"]["win_rate"] < filters["random"]:
         return False, results, self.best_score
 
-    # 2. Tier: Heuristic Bot
+    # Tier 2: Heuristic Bot
     if "heuristic" in active_tiers:
       eps = tier_ep_counts.get("heuristic", 20)
       results["heuristic"] = self.evaluate_matchup(
@@ -472,11 +493,11 @@ class SelfPlayPool:
       if "heuristic" in filters and results["heuristic"]["win_rate"] < filters["heuristic"]:
         return False, results, self.best_score
 
-    # 3. Tier: Champion (Self-Play)
+    # Tier 3: Champion (Self-Play Model)
     if "champion" in active_tiers:
       eps = tier_ep_counts.get("champion", 30)
       if os.path.exists(self.champion_path):
-        champ = ActorCritic().to(device)
+        champ = TransformerActorCritic().to(device)
         ckpt = torch.load(self.champion_path, map_location=device, weights_only=False)
         state_dict = (
             ckpt["model_state_dict"]
