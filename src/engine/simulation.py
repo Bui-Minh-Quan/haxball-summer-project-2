@@ -78,27 +78,76 @@ class Simulation:
             self.controllers.append(slot.controller)
 
     def reset_positions(self):
-        """Resets the ball and positions players dynamically based on pitch dimensions."""
+        """Resets the ball and positions players dynamically based on pitch dimensions and team size."""
         self.ball.pos = Vec2(self.center.x, self.center.y)
         self.ball.vel = Vec2(0.0, 0.0)
 
         p = self.pitch
-        circle_r = p.center_circle_radius
+        circle_r = getattr(p, "center_circle_radius", 176.0)
         kickoff_team = getattr(self.mode, "kickoff_team", "red")
 
-        for player in self.all_players:
-            player.vel = Vec2(0.0, 0.0)
-            is_kicking = player.team == kickoff_team
+        for team_name, squad in [("red", self.red_team), ("blue", self.blue_team)]:
+            sign = -1.0 if team_name == "red" else 1.0
+            is_kicking_team = (team_name == kickoff_team)
+            n_players = len(squad)
 
-            # Kicker starts near center ball; Defender starts outside the circle
-            if is_kicking:
-                offset_x = min(80.0, circle_r * 0.4)
+            if n_players == 1:
+                # 1v1 Kickoff
+                pl = squad[0]
+                pl.vel = Vec2(0.0, 0.0)
+                pl.kick_cooldown_timer = 0.0
+                offset_x = min(80.0, circle_r * 0.4) if is_kicking_team else (circle_r + pl.radius + 30.0)
+                pl.pos = Vec2(self.center.x + sign * offset_x, self.center.y)
+
+            elif n_players == 2:
+                # 2v2 Kickoff: Primary striker + Wing defender
+                for i, pl in enumerate(squad):
+                    pl.vel = Vec2(0.0, 0.0)
+                    pl.kick_cooldown_timer = 0.0
+                    if is_kicking_team:
+                        if i == 0:
+                            # Primary Kicker on center circle
+                            px = self.center.x + sign * min(80.0, circle_r * 0.4)
+                            py = self.center.y
+                        else:
+                            # Second teammate staggered back
+                            px = self.center.x + sign * (circle_r * 0.85)
+                            py = self.center.y + 110.0
+                    else:
+                        # Defenders outside circle in separate lanes
+                        px = self.center.x + sign * (circle_r + pl.radius + 35.0)
+                        py = self.center.y + (-90.0 if i == 0 else 90.0)
+                    pl.pos = Vec2(px, py)
+
             else:
-                offset_x = circle_r + player.radius + 30.0
+                # 3v3 Kickoff: Striker + Upper & Lower Wings
+                for i, pl in enumerate(squad):
+                    pl.vel = Vec2(0.0, 0.0)
+                    pl.kick_cooldown_timer = 0.0
+                    if is_kicking_team:
+                        if i == 0:
+                            px = self.center.x + sign * min(80.0, circle_r * 0.4)
+                            py = self.center.y
+                        elif i == 1:
+                            px = self.center.x + sign * (circle_r * 0.85)
+                            py = self.center.y - 120.0
+                        else:
+                            px = self.center.x + sign * (circle_r * 1.25)
+                            py = self.center.y + 120.0
+                    else:
+                        # Defensive triangle outside the center circle
+                        if i == 0:
+                            px = self.center.x + sign * (circle_r + pl.radius + 35.0)
+                            py = self.center.y
+                        elif i == 1:
+                            px = self.center.x + sign * (circle_r + pl.radius + 60.0)
+                            py = self.center.y - 135.0
+                        else:
+                            px = self.center.x + sign * (circle_r + pl.radius + 60.0)
+                            py = self.center.y + 135.0
 
-            sign = -1.0 if player.team == "red" else 1.0
-            player.pos = Vec2(self.center.x + sign * offset_x, self.center.y)
-
+                    pl.pos = Vec2(px, py)
+                    
     def step(self, dt: float) -> str | None:
         self.kicked_this_step = False
         real_dt = dt

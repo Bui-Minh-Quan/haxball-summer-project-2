@@ -226,8 +226,8 @@ class MatchSetupState(GameState):
     # 3. Opponent Type
     self.drop_opponent = Dropup(
         rect=pygame.Rect(left_x, 395, col_w, 42),
-        label="OPPONENT AI",
-        options=["RL Agent (ONNX)", "Heuristic Bot"],
+        label="OPPONENT TYPE",
+        options=["MLP Agent", "Heuristic Bot"],
         values=["rl", "heuristic"],
         default_idx=s.get("opp_idx", 0),
     )
@@ -308,7 +308,7 @@ class MatchSetupState(GameState):
           "assets", "models", f"stage{format_size}.onnx"
       )
       if os.path.exists(model_path):
-        return ONNXBotController(model_path, team=team), f"RL Bot (Stage {format_size})"
+        return ONNXBotController(model_path, team=team), f"RL Bot"
       print(
           f"[Warning] ONNX model {model_path} not found. Falling back to Heuristic Bot."
       )

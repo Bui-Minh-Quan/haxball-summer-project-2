@@ -5,252 +5,148 @@ from src.engine.vector import Vec2
 
 
 class TeamHeuristicCoordinator:
-  """Tactical 3-bot coordinator:
+    """Decisive, non-orbiting heuristic coordinator.
+    - Uses predictive ball interception instead of trailing behind.
+    - Hysteresis state machine (APPROACH vs. STRIKE) eliminates tail-chasing.
+    - Infield-biased flanking prevents getting stuck against walls.
+    """
 
-  - GK & Defender: Lock down defensive half and pass directly to the striker.
-  - Striker: Stays strictly in the attacking half, roaming to open passing lanes.
-  """
+    def __init__(self, team: str = "blue"):
+        self.team = team.lower()
+        # Red attacks +X (right); Blue attacks -X (left)
+        self.attack_sign = 1.0 if self.team == "red" else -1.0
+        # Persistent state per bot instance: 'APPROACH' or 'STRIKE'
+        self._bot_state: dict[int, str] = {}
 
-  def __init__(self, team: str = "blue"):
-    self.team = team
+    def _determine_role(self, bot_player: Player, my_team: list[Player]) -> str:
+        if len(my_team) == 1:
+            return "STRIKER"
+        try:
+            idx = my_team.index(bot_player)
+        except ValueError:
+            return "STRIKER"
 
-  def _is_path_blocked(
-      self,
-      start: Vec2,
-      end: Vec2,
-      opponents: list[Player],
-      radius_threshold: float = 38.0,
-  ) -> bool:
-    """Raycast check to determine if an opponent obstructs a trajectory."""
-    ray = end - start
-    ray_len = ray.length()
-    if ray_len < 1e-4:
-      return False
-
-    ray_dir = ray.normalize()
-    for opp in opponents:
-      to_opp = opp.pos - start
-      proj = to_opp.x * ray_dir.x + to_opp.y * ray_dir.y
-      if 0.0 < proj < ray_len:
-        perp_dist = abs(to_opp.x * (-ray_dir.y) + to_opp.y * ray_dir.x)
-        if perp_dist < radius_threshold:
-          return True
-    return False
-
-  def _determine_role(self, bot_player: Player, my_team: list[Player]) -> str:
-    """Assigns deterministic tactical roles by roster index."""
-    if len(my_team) == 1:
-      return "STRIKER"
-
-    try:
-      idx = my_team.index(bot_player)
-    except ValueError:
-      return "STRIKER"
-
-    if len(my_team) == 2:
-      return "GK" if idx == 0 else "STRIKER"
-    else:
-      if idx == 0:
-        return "GK"
-      elif idx == 1:
-        return "DEFENDER"
-      return "STRIKER"
-
-  def _select_shot_target(
-      self,
-      pred_ball: Vec2,
-      opp_team: list[Player],
-      opp_goal_x: float,
-      center_y: float,
-      goal_h: float,
-  ) -> Vec2:
-    """Selects the goal post corner furthest from the opponent keeper."""
-    post_margin = 18.0
-    top_post = Vec2(opp_goal_x, center_y - (goal_h * 0.5) + post_margin)
-    bot_post = Vec2(opp_goal_x, center_y + (goal_h * 0.5) - post_margin)
-
-    if not opp_team:
-      return Vec2(opp_goal_x, center_y)
-
-    opp_gk = min(opp_team, key=lambda opp: abs(opp.pos.x - opp_goal_x))
-    dist_to_top = opp_gk.pos.distance_to(top_post)
-    dist_to_bot = opp_gk.pos.distance_to(bot_post)
-
-    top_blocked = self._is_path_blocked(pred_ball, top_post, opp_team)
-    bot_blocked = self._is_path_blocked(pred_ball, bot_post, opp_team)
-
-    if not top_blocked and bot_blocked:
-      return top_post
-    if not bot_blocked and top_blocked:
-      return bot_post
-
-    return top_post if dist_to_top >= dist_to_bot else bot_post
-
-  def _find_striker(self, my_team: list[Player]) -> Player | None:
-    for pl in my_team:
-      if self._determine_role(pl, my_team) == "STRIKER":
-        return pl
-    return None
-
-  def get_action(
-      self, bot_player: Player, sim: Simulation
-  ) -> tuple[Vec2, bool]:
-    my_team = sim.red_team if self.team == "red" else sim.blue_team
-    opp_team = sim.blue_team if self.team == "red" else sim.red_team
-    ball = sim.ball
-    p = sim.pitch
-    sign = 1.0 if self.team == "red" else -1.0
-
-    pitch_w = p.right - p.left
-    pitch_h = p.bottom - p.top
-    goal_h = getattr(p, "goal_height", 220.0)
-
-    own_goal_x = p.left if self.team == "red" else p.right
-    opp_goal_x = p.right if self.team == "red" else p.left
-    own_goal_pos = Vec2(own_goal_x, sim.center.y)
-
-    role = self._determine_role(bot_player, my_team)
-    striker_teammate = self._find_striker(my_team)
-    safe_m = bot_player.radius + 8.0
-
-    # ── 1. Ball Prediction ──
-    dist_to_ball = bot_player.pos.distance_to(ball.pos)
-    lead_time = max(0.04, min(0.32, dist_to_ball / 750.0))
-    pred_ball_pos = ball.pos + (ball.vel * lead_time)
-
-    target = bot_player.pos
-    kick = False
-    kick_reach = (
-        bot_player.radius + ball.radius + bot_player.stats.kick_margin + 6.0
-    )
-
-    ball_in_attacking_half = (sign * (ball.pos.x - sim.center.x)) > -30.0
-
-    # ==========================================================
-    # ROLE: STRIKER (Poacher / Attacking Half Anchor)
-    # ==========================================================
-    if role == "STRIKER":
-      if ball_in_attacking_half:
-        # Actively attack ball and score
-        shot_target = self._select_shot_target(
-            pred_ball_pos, opp_team, opp_goal_x, sim.center.y, goal_h
-        )
-        shot_dir = (shot_target - pred_ball_pos).normalize()
-        ideal_strike_pos = pred_ball_pos - (shot_dir * (bot_player.radius + 14.0))
-
-        to_ball = pred_ball_pos - bot_player.pos
-        dist_ball = to_ball.length()
-        dir_to_ball = to_ball.normalize() if dist_ball > 0 else shot_dir
-
-        alignment = dir_to_ball.x * shot_dir.x + dir_to_ball.y * shot_dir.y
-        if alignment > 0.40:
-          target = pred_ball_pos + (shot_dir * 30.0)
+        if len(my_team) == 2:
+            return "GK" if idx == 0 else "STRIKER"
         else:
-          cross = shot_dir.x * to_ball.y - shot_dir.y * to_ball.x
-          side = 1.0 if cross >= 0 else -1.0
-          perp = Vec2(-shot_dir.y * side, shot_dir.x * side)
-          evasion_weight = max(0.0, 1.0 - (dist_ball / 130.0))
-          target = ideal_strike_pos + (perp * 80.0 * evasion_weight)
+            if idx == 0:
+                return "GK"
+            elif idx == 1:
+                return "DEFENDER"
+            return "STRIKER"
 
-        if bot_player.pos.distance_to(ball.pos) <= kick_reach:
-          bot_to_ball = (ball.pos - bot_player.pos).normalize()
-          if (bot_to_ball.x * sign) > 0.10:
-            kick = True
+    def _get_striker_action(
+        self, bot_player: Player, sim: Simulation
+    ) -> tuple[Vec2, bool]:
+        ball = sim.ball
+        p = sim.pitch
+        bot_id = id(bot_player)
+        current_state = self._bot_state.get(bot_id, "APPROACH")
 
-      else:
-        # Ball in defensive half: Hold attacking shape and open up passing lane
-        base_anchor_x = sim.center.x + (sign * (pitch_w * 0.26))
-        # Mirror ball Y slightly while staying within pitch bounds
-        base_anchor_y = sim.center.y + (ball.pos.y - sim.center.y) * 0.60
+        # 1. Predictive Interception (Lead the ball so we don't chase its tail)
+        dist_to_ball = bot_player.pos.distance_to(ball.pos)
+        lead_t = max(0.04, min(0.28, dist_to_ball / 850.0))
+        pred_ball_x = ball.pos.x + (ball.vel.x * lead_t)
+        pred_ball_y = ball.pos.y + (ball.vel.y * lead_t)
 
-        # Adjust position if opponent is directly obstructing clearance path
-        test_pos = Vec2(base_anchor_x, base_anchor_y)
-        if self._is_path_blocked(ball.pos, test_pos, opp_team, radius_threshold=42.0):
-          offset_sign = 1.0 if base_anchor_y >= sim.center.y else -1.0
-          base_anchor_y -= offset_sign * 110.0
+        # Longitudinal and lateral offsets relative to attack direction
+        # dx > 0 means the ball is ahead of the bot in the attack direction (bot is behind ball)
+        dx = (pred_ball_x - bot_player.pos.x) * self.attack_sign
+        dy = pred_ball_y - bot_player.pos.y
 
-        target = Vec2(base_anchor_x, base_anchor_y)
+        # 2. Hysteresis State Machine (Eliminates oscillation)
+        if current_state == "APPROACH":
+            # Only enter STRIKE when solidly behind the ball and lined up in Y
+            if dx > 25.0 and abs(dy) < 50.0:
+                current_state = "STRIKE"
+        elif current_state == "STRIKE":
+            # Only drop out of STRIKE if we have completely overshot past the ball
+            if dx < -30.0:
+                current_state = "APPROACH"
 
-      # Hard constraint: Striker never crosses back into defensive half
-      min_striker_x = sim.center.x + (sign * 50.0)
-      if sign > 0:
-        target.x = max(target.x, min_striker_x)
-      else:
-        target.x = min(target.x, min_striker_x)
+        self._bot_state[bot_id] = current_state
 
-    # ==========================================================
-    # ROLES: GK & DEFENDER (Defend and Feed Striker)
-    # ==========================================================
-    else:
-      pass_target = None
-      if striker_teammate is not None:
-        # Lead the striker slightly forward into the attacking channel
-        pass_target = striker_teammate.pos + Vec2(sign * 25.0, 0.0)
-      else:
-        pass_target = Vec2(opp_goal_x, sim.center.y)
+        # 3. Target Calculation Based on State
+        behind_x = pred_ball_x - (self.attack_sign * 55.0)
 
-      is_pass_blocked = self._is_path_blocked(
-          pred_ball_pos, pass_target, opp_team, radius_threshold=36.0
-      )
-      clearance_dir = (
-          (pass_target - pred_ball_pos).normalize()
-          if not is_pass_blocked
-          else Vec2(sign, (1.0 if pred_ball_pos.y < sim.center.y else -1.0) * 0.4).normalize()
-      )
-
-      if role == "GK":
-        max_gk_advance = min(220.0, pitch_w * 0.25)
-        ball_in_box = (
-            sign * (ball.pos.x - own_goal_x) < (pitch_w * 0.22)
-            and abs(ball.pos.y - sim.center.y) < (goal_h * 1.2)
-        )
-
-        if ball_in_box:
-          ideal_approach = pred_ball_pos - (clearance_dir * (bot_player.radius + 12.0))
-          target = ideal_approach if bot_player.pos.distance_to(pred_ball_pos) > 40.0 else pred_ball_pos
+        if current_state == "STRIKE":
+            # Drive straight through the ball into the opponent goal
+            target_x = pred_ball_x + (self.attack_sign * 40.0)
+            target_y = pred_ball_y
         else:
-          to_ball = ball.pos - own_goal_pos
-          step_out = min(max_gk_advance, max(45.0, to_ball.length() * 0.18))
-          target_x = own_goal_x + (sign * step_out)
-          goal_half = (goal_h * 0.5) - 10.0
-          target_y = min(
-              max(sim.center.y - goal_half, ball.pos.y), sim.center.y + goal_half
-          )
-          target = Vec2(target_x, target_y)
+            # APPROACH: Loop behind the ball
+            if dx < 15.0:
+                # Bot is in front: Flank toward the pitch center (never into a wall)
+                infield_y_sign = -1.0 if ball.pos.y > sim.center.y else 1.0
+                target_x = behind_x
+                target_y = ball.pos.y + (infield_y_sign * 75.0)
+            else:
+                # Bot is already behind in X, just slide into alignment in Y
+                target_x = behind_x
+                target_y = pred_ball_y
 
-        # Clamped to defensive third
-        max_x_allowed = sim.center.x - (sign * (pitch_w * 0.15))
-        target.x = min(target.x, max_x_allowed) if sign > 0 else max(target.x, max_x_allowed)
+        # 4. Field Clamping & Direct Throttle
+        target_x = max(p.outer_left + 25.0, min(p.outer_right - 25.0, target_x))
+        target_y = max(p.outer_top + 25.0, min(p.outer_bottom - 25.0, target_y))
 
-      elif role == "DEFENDER":
-        ball_in_defensive_zone = (sign * (ball.pos.x - sim.center.x)) < 120.0
+        move_vec = Vec2(target_x, target_y) - bot_player.pos
+        move_dir = move_vec.normalize() if move_vec.length() > 3.0 else Vec2(0.0, 0.0)
 
-        if ball_in_defensive_zone:
-          ideal_approach = pred_ball_pos - (clearance_dir * (bot_player.radius + 14.0))
-          target = ideal_approach if bot_player.pos.distance_to(pred_ball_pos) > 45.0 else pred_ball_pos
+        # 5. Kick Trigger
+        kick = False
+        kick_reach = bot_player.radius + ball.radius + bot_player.stats.kick_margin + 6.0
+        if dist_to_ball <= kick_reach:
+            # Kick only if impulse moves ball toward opponent net (prevents own-goals)
+            if ((ball.pos.x - bot_player.pos.x) * self.attack_sign) > -3.0:
+                kick = True
+
+        return move_dir, kick
+
+    def get_action(
+        self, bot_player: Player, sim: Simulation
+    ) -> tuple[Vec2, bool]:
+        my_team = sim.red_team if self.team == "red" else sim.blue_team
+        role = self._determine_role(bot_player, my_team)
+
+        ball = sim.ball
+        p = sim.pitch
+        own_goal_x = p.left if self.team == "red" else p.right
+
+        # ── 1. STRIKER / 1v1 (Pure Ball Hunter) ──
+        if role == "STRIKER":
+            return self._get_striker_action(bot_player, sim)
+
+        # ── 2. GOALKEEPER (2v2 & 3v3) ──
+        elif role == "GK":
+            dist_ball_to_goal = abs(ball.pos.x - own_goal_x)
+            # If ball enters the danger box, charge out and clear like a striker
+            if dist_ball_to_goal < 230.0 and abs(ball.pos.y - sim.center.y) < 180.0:
+                return self._get_striker_action(bot_player, sim)
+
+            # Otherwise, patrol the goal line
+            goal_half = getattr(p, "goal_height", 220.0) * 0.5 - 15.0
+            target_x = own_goal_x + self.attack_sign * 55.0
+            target_y = min(max(sim.center.y - goal_half, ball.pos.y), sim.center.y + goal_half)
+
+            move_vec = Vec2(target_x, target_y) - bot_player.pos
+            move_dir = move_vec.normalize() if move_vec.length() > 3.0 else Vec2(0.0, 0.0)
+
+            to_ball = ball.pos - bot_player.pos
+            kick_reach = bot_player.radius + ball.radius + bot_player.stats.kick_margin + 6.0
+            kick = to_ball.length() <= kick_reach and (to_ball.x * self.attack_sign) > -2.0
+            return move_dir, kick
+
+        # ── 3. DEFENDER (3v3 Midfield Anchor) ──
         else:
-          # Hold midfield anchor line
-          anchor_x = sim.center.x - (sign * (pitch_w * 0.12))
-          anchor_y = sim.center.y + (ball.pos.y - sim.center.y) * 0.50
-          target = Vec2(anchor_x, anchor_y)
+            # Challenge any ball that crosses into the defensive half
+            ball_in_our_half = (ball.pos.x - sim.center.x) * self.attack_sign < 60.0
+            if ball_in_our_half:
+                return self._get_striker_action(bot_player, sim)
 
-        # Defender boundary clamp
-        max_def_x = sim.center.x + (sign * (pitch_w * 0.08))
-        target.x = min(target.x, max_def_x) if sign > 0 else max(target.x, max_def_x)
+            # Hold midfield support anchor
+            target_x = sim.center.x - (self.attack_sign * 110.0)
+            target_y = sim.center.y + (ball.pos.y - sim.center.y) * 0.55
 
-      # Direct Clearance / Passing Trigger
-      if bot_player.pos.distance_to(ball.pos) <= kick_reach:
-        bot_to_ball = (ball.pos - bot_player.pos).normalize()
-        kick_alignment = bot_to_ball.x * clearance_dir.x + bot_to_ball.y * clearance_dir.y
-        if kick_alignment > 0.15 or (bot_to_ball.x * sign) > 0.0:
-          kick = True
-
-    # ── 3. Pitch Boundary Clamping & Motor Vector ──
-    target.x = max(p.outer_left + safe_m, min(p.outer_right - safe_m, target.x))
-    target.y = max(p.outer_top + safe_m, min(p.outer_bottom - safe_m, target.y))
-
-    to_target = target - bot_player.pos
-    dist_target = to_target.length()
-    move_dir = to_target.normalize() if dist_target > 6.0 else Vec2(0.0, 0.0)
-
-    return move_dir, kick
+            move_vec = Vec2(target_x, target_y) - bot_player.pos
+            move_dir = move_vec.normalize() if move_vec.length() > 3.0 else Vec2(0.0, 0.0)
+            return move_dir, False
