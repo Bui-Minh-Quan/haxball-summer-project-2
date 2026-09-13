@@ -12,9 +12,9 @@ from src.engine.controllers import Controller, HeuristicBotController
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
-from src.rl_2.env_adapter import RandomOpponentController
-from src.rl_2.model import ActorCritic
-from src.rl_2.obs import extract_actor_obs
+from src.rl.env_adapter import RandomOpponentController
+from src.rl.model import ActorCritic
+from src.rl.obs import extract_actor_obs
 
 
 class PoolOpponentController(Controller):

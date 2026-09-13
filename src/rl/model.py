@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 
-from src.rl_2.obs import ACTOR_OBS_DIM, CRITIC_STATE_DIM
+from src.rl.obs import ACTOR_OBS_DIM, CRITIC_STATE_DIM
 
 
 def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Linear:

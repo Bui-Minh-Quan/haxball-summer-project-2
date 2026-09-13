@@ -222,5 +222,5 @@ training/models/*
 *.pt 
 
 # Replay render files
-training/render/*
-training_2/render/*
+*render*/
+repomix-output.xml

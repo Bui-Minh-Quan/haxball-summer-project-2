@@ -10,7 +10,7 @@ from src.engine.controllers import Controller
 from src.engine.modes.classic_mode import ClassicMatchMode
 from src.engine.simulation import Simulation
 from src.engine.vector import Vec2
-from src.rl_2.obs import (
+from src.rl.obs import (
     ACTOR_OBS_DIM,
     CRITIC_STATE_DIM,
     extract_actor_obs,

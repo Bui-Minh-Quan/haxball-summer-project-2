@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from src.rl_2.model import ActorCritic
-from src.rl_2.obs import ACTOR_OBS_DIM, CRITIC_STATE_DIM
-from src.rl_2.pool import SelfPlayPool
+from src.rl.model import ActorCritic
+from src.rl.obs import ACTOR_OBS_DIM, CRITIC_STATE_DIM
+from src.rl.pool import SelfPlayPool
 
 
 def train_mappo(
