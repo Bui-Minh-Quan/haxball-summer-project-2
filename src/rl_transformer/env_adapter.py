@@ -1,3 +1,4 @@
+from collections import deque
 from collections.abc import Callable
 import random
 import gymnasium as gym
@@ -25,6 +26,7 @@ OpponentStatsType = (
     | list[tuple[float, float]]
     | Callable[[], tuple[float, float]]
 )
+
 
 
 class ActionPlaceholder(Controller):
@@ -75,6 +77,8 @@ class MatchEnv(gym.Env):
       pitch_height: float = 800.0,
       opponent_controller: Controller | None = None,
       opponent_stats: OpponentStatsType = (3200.0, 1200.0),
+      random_reset_opponents: list[str] | None = None,
+      frame_stack: int = 3,
   ):
     super().__init__()
     self.learner_team_size = learner_team_size or team_size
@@ -91,6 +95,11 @@ class MatchEnv(gym.Env):
 
     self.opponent_controller = opponent_controller or RandomOpponentController()
     self.opponent_stats = opponent_stats
+    self.random_reset_opponents = set(random_reset_opponents or ["random"])
+
+    # Temporal Frame Stacking Deque
+    self.frame_stack = frame_stack
+    self.obs_history = deque(maxlen=self.frame_stack)
 
     self._ego_dirs = [
         (0.0, 0.0),   # 0: None
@@ -191,8 +200,24 @@ class MatchEnv(gym.Env):
 
     if hasattr(self.sim, "mode"):
       self.sim.mode.state = "PLAYING"
+      if hasattr(self.sim.mode, "score_limit"):
+        self.sim.mode.score_limit = 999
       if hasattr(self.sim.mode, "reset_positions"):
         self.sim.mode.reset_positions = lambda *args, **kwargs: None
+
+
+  def _should_random_reset(self) -> bool:
+    """Checks if the active opponent mode matches the random reset criteria."""
+    if "all" in self.random_reset_opponents:
+      return True
+
+    # Identify opponent mode
+    if isinstance(self.opponent_controller, RandomOpponentController):
+      curr_mode = "random"
+    else:
+      curr_mode = getattr(self.opponent_controller, "current_mode", "heuristic")
+
+    return curr_mode in self.random_reset_opponents
 
   def _reset_kickoff(self):
     p = self.sim.pitch
@@ -200,8 +225,8 @@ class MatchEnv(gym.Env):
     safe_m = 50.0
     min_dist = 52.0
 
-    # 1. Pure Random Spawn across the Entire Pitch (Random Opponent Active)
-    if self._is_random_opponent():
+    # 1. Full-pitch chaotic spawn (Triggered if opponent matches configured modes)
+    if self._should_random_reset():
       self.sim.ball.pos = Vec2(
           random.uniform(p.left + safe_m, p.right - safe_m),
           random.uniform(p.top + safe_m, p.bottom - safe_m),
@@ -235,7 +260,7 @@ class MatchEnv(gym.Env):
         pl.kick_cooldown_timer = 0.0
       return
 
-    # 2. Standard Structured Kickoff (Heuristic & Self-Play)
+    # 2. Standard Structured Kickoff (Clean symmetrical half-pitch spawns)
     self.sim.ball.pos = Vec2(c.x, c.y)
     self.sim.ball.vel = Vec2(0.0, 0.0)
 
@@ -283,17 +308,15 @@ class MatchEnv(gym.Env):
       pl.vel = Vec2(0.0, 0.0)
       pl.kick_cooldown_timer = 0.0
 
-  def _get_obs_payload(self) -> dict[str, np.ndarray]:
+  def _extract_single_payload(self) -> dict[str, np.ndarray]:
+    """Extracts instantaneous single-frame entity tokens."""
     squad = self.sim.red_team if self.learner_team == "red" else self.sim.blue_team
-
     actor_tokens = [extract_entity_obs(self.sim, player, self.learner_team) for player in squad]
 
     if self.learner_team_size == 1:
       act_data = actor_tokens[0]
-      ego_arr = act_data["ego"]
-      ball_arr = act_data["ball"]
-      mates_arr = act_data["teammates"]
-      opps_arr = act_data["opponents"]
+      ego_arr, ball_arr = act_data["ego"], act_data["ball"]
+      mates_arr, opps_arr = act_data["teammates"], act_data["opponents"]
       mask_arr = act_data["key_padding_mask"]
     else:
       ego_arr = np.stack([t["ego"] for t in actor_tokens], axis=0)
@@ -303,7 +326,6 @@ class MatchEnv(gym.Env):
       mask_arr = np.stack([t["key_padding_mask"] for t in actor_tokens], axis=0)
 
     critic_data = extract_global_critic_entities(self.sim, self.learner_team)
-
     return {
         "actor_ego": ego_arr,
         "actor_ball": ball_arr,
@@ -316,32 +338,61 @@ class MatchEnv(gym.Env):
         "critic_mask": critic_data["key_padding_mask"],
     }
 
+  def _get_obs_payload(self) -> dict[str, np.ndarray]:
+    """Extracts current frame and concatenates history along the feature dimension."""
+    curr = self._extract_single_payload()
+
+    # Self-healing prime: guarantees history always has exactly K frames
+    if len(self.obs_history) == 0:
+      for _ in range(self.frame_stack):
+        self.obs_history.append(curr)
+    else:
+      self.obs_history.append(curr)
+
+    stacked = {
+        "actor_mask": curr["actor_mask"],
+        "critic_mask": curr["critic_mask"],
+    }
+    for key in (
+        "actor_ego",
+        "actor_ball",
+        "actor_teammates",
+        "actor_opponents",
+        "critic_ball",
+        "critic_learners",
+        "critic_opponents",
+    ):
+      stacked[key] = np.concatenate([f[key] for f in self.obs_history], axis=-1)
+
+    return stacked
+
   def reset(self, seed: int | None = None, options: dict | None = None):
-    super().reset(seed=seed)
-    if seed is not None:
-      random.seed(seed)
-      np.random.seed(seed)
+      super().reset(seed=seed)
+      if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
-    self.current_step = 0
-    self.match_time_remaining = float(self.max_round_steps) / 60.0
-    self.sim.score_red = 0
-    self.sim.score_blue = 0
+      self.current_step = 0
+      self.match_time_remaining = float(self.max_round_steps) / 60.0
+      self.sim.score_red = 0
+      self.sim.score_blue = 0
 
-    if hasattr(self.opponent_controller, "reset_opponent"):
-      self.opponent_controller.reset_opponent()
+      if hasattr(self.opponent_controller, "reset_opponent"):
+        self.opponent_controller.reset_opponent()
 
-    accel, kick = self._sample_opponent_stats()
-    opp_squad = self.sim.blue_team if self.learner_team == "red" else self.sim.red_team
-    for player in opp_squad:
-      player.stats.accel = accel
-      player.stats.kick_strength = kick
+      accel, kick = self._sample_opponent_stats()
+      opp_squad = self.sim.blue_team if self.learner_team == "red" else self.sim.red_team
+      for player in opp_squad:
+        player.stats.accel = accel
+        player.stats.kick_strength = kick
 
-    if hasattr(self.sim.mode, "time_remaining"):
-      self.sim.mode.time_remaining = self.match_time_remaining
-      self.sim.mode.state = "PLAYING"
+      if hasattr(self.sim.mode, "time_remaining"):
+        self.sim.mode.time_remaining = self.match_time_remaining
+        self.sim.mode.state = "PLAYING"
 
-    self._reset_kickoff()
-    return self._get_obs_payload(), {}
+      self._reset_kickoff()
+      self.obs_history.clear()
+      return self._get_obs_payload(), {}
 
   def step(self, action):
     dt = 1.0 / 60.0
@@ -373,11 +424,16 @@ class MatchEnv(gym.Env):
 
       if hasattr(self.sim, "mode"):
         self.sim.mode.state = "PLAYING"
+        if hasattr(self.sim.mode, "score_limit"):
+          self.sim.mode.score_limit = 999
 
       if goal_event is not None:
         scored = goal_event == f"{self.learner_team}_goal"
         total_reward += 1.0 if scored else -1.0
         self._reset_kickoff()
+        self.obs_history.clear()
+        if hasattr(self.opponent_controller, "history"):
+          self.opponent_controller.history.clear()
         break
 
       if (

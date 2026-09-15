@@ -18,16 +18,13 @@ def layer_init(layer: nn.Linear, std: float = math.sqrt(2), bias_const: float = 
 
 
 class TransformerActor(nn.Module):
-  """Permutation-invariant Entity-Transformer Actor.
-
-  Processes local ego perspective and reads out categorical movement and kick actions.
-  """
+  """Permutation-invariant Entity-Transformer Actor operating on stacked temporal tokens."""
 
   def __init__(
       self,
-      ego_dim: int = EGO_DIM,          # 9
-      ball_dim: int = BALL_DIM,        # 10
-      player_dim: int = PLAYER_DIM,    # 7
+      ego_dim: int = EGO_DIM,          # 27
+      ball_dim: int = BALL_DIM,        # 30
+      player_dim: int = PLAYER_DIM,    # 21
       d_model: int = 64,
       nhead: int = 4,
       num_layers: int = 2,
@@ -35,46 +32,63 @@ class TransformerActor(nn.Module):
     super().__init__()
     self.d_model = d_model
 
-    # 1. Dedicated feature encoders for each entity type
+    # 1. Dedicated feature encoders mapping stacked inputs to d_model
     self.ego_encoder = nn.Sequential(
         layer_init(nn.Linear(ego_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
     self.ball_encoder = nn.Sequential(
         layer_init(nn.Linear(ball_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
     self.teammate_encoder = nn.Sequential(
         layer_init(nn.Linear(player_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
     self.opponent_encoder = nn.Sequential(
         layer_init(nn.Linear(player_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
 
     # 2. Learnable categorical type embeddings: 0: Ego, 1: Ball, 2: Teammate, 3: Opponent
     self.type_embed = nn.Embedding(4, d_model)
 
-    # 3. Transformer Encoder Backbone (Zero Dropout for PPO on-policy stability)
+    # 3. Transformer Encoder Backbone
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=d_model,
         nhead=nhead,
         dim_feedforward=d_model * 2,
         dropout=0.0,
-        activation="relu",
+        activation="gelu",
         batch_first=True,
         norm_first=True,
     )
-    self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+    self.transformer = nn.TransformerEncoder(
+        encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+    )
 
-    # 4. Action Readout Heads (operating on contextualized Ego token at Index 0)
+    # 4. Direct linear readout heads
     self.move_head = layer_init(nn.Linear(d_model, 9), std=0.01)
     self.kick_head = layer_init(nn.Linear(d_model, 2), std=0.01)
+
+  @torch.inference_mode()
+  def predict_action(
+      self,
+      ego: torch.Tensor,
+      ball: torch.Tensor,
+      teammates: torch.Tensor,
+      opponents: torch.Tensor,
+      key_padding_mask: torch.Tensor | None = None,
+  ) -> tuple[int, bool]:
+    """Fast CPU inference path for opponents that bypasses Categorical distribution overhead."""
+    move_logits, kick_logits = self.forward(ego, ball, teammates, opponents, key_padding_mask)
+    m_idx = int(torch.argmax(move_logits[0]).item())
+    k_val = bool(kick_logits[0, 1] > kick_logits[0, 0])
+    return m_idx, k_val
 
   def forward(
       self,
@@ -84,7 +98,6 @@ class TransformerActor(nn.Module):
       opponents: torch.Tensor,
       key_padding_mask: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Project raw features to d_model
     e_ego = self.ego_encoder(ego).unsqueeze(1) + self.type_embed(
         torch.tensor(0, device=ego.device)
     )
@@ -98,12 +111,10 @@ class TransformerActor(nn.Module):
         torch.tensor(3, device=opponents.device)
     )
 
-    # Sequence shape: [Batch, Tokens=7, d_model]
     tokens = torch.cat([e_ego, e_ball, e_mates, e_opps], dim=1)
-
     h = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
 
-    # Readout from contextualized Ego token (Index 0)
+    # Readout directly from contextualized Ego token (Index 0)
     h_ego = h[:, 0, :]
     move_logits = self.move_head(h_ego)
     kick_logits = self.kick_head(h_ego)
@@ -112,16 +123,12 @@ class TransformerActor(nn.Module):
 
 
 class TransformerCritic(nn.Module):
-  """Centralized Entity-Transformer Critic.
-
-  Processes pitch-centric global entities, applies masked mean pooling across all tokens,
-  and outputs a scalar state-value estimate V(s).
-  """
+  """Centralized Entity-Transformer Critic operating on stacked temporal tokens."""
 
   def __init__(
       self,
-      ball_dim: int = BALL_DIM,        # 10
-      player_dim: int = PLAYER_DIM,    # 7
+      ball_dim: int = BALL_DIM,        # 30
+      player_dim: int = PLAYER_DIM,    # 21
       d_model: int = 64,
       nhead: int = 4,
       num_layers: int = 2,
@@ -129,42 +136,41 @@ class TransformerCritic(nn.Module):
     super().__init__()
     self.d_model = d_model
 
-    # 1. Dedicated feature encoders for pitch-centric entities
     self.ball_encoder = nn.Sequential(
         layer_init(nn.Linear(ball_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
     self.learner_encoder = nn.Sequential(
         layer_init(nn.Linear(player_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
     self.opponent_encoder = nn.Sequential(
         layer_init(nn.Linear(player_dim, d_model)),
         nn.LayerNorm(d_model),
-        nn.ReLU(),
+        nn.GELU(),
     )
 
-    # 2. Learnable categorical type embeddings: 0: Ball, 1: Learner, 2: Opponent
+    # 0: Ball, 1: Learner, 2: Opponent
     self.type_embed = nn.Embedding(3, d_model)
 
-    # 3. Transformer Encoder Backbone
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=d_model,
         nhead=nhead,
         dim_feedforward=d_model * 2,
         dropout=0.0,
-        activation="relu",
+        activation="gelu",
         batch_first=True,
         norm_first=True,
     )
-    self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
+    self.transformer = nn.TransformerEncoder(
+        encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+    )
 
-    # 4. Value Head projecting pooled pitch representation to V(s)
     self.value_head = nn.Sequential(
         layer_init(nn.Linear(d_model, d_model)),
-        nn.ReLU(),
+        nn.GELU(),
         layer_init(nn.Linear(d_model, 1), std=1.0),
     )
 
@@ -185,21 +191,17 @@ class TransformerCritic(nn.Module):
         torch.tensor(2, device=opponents.device)
     )
 
-    # Sequence shape: [Batch, Tokens=7, d_model]
     tokens = torch.cat([e_ball, e_learners, e_opps], dim=1)
-
     h = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
 
-    # Masked mean pooling across all active entities
     if key_padding_mask is not None:
-      mask = (~key_padding_mask).unsqueeze(-1).float()  # True=ignore -> invert
+      mask = (~key_padding_mask).unsqueeze(-1).float()
       h_pooled = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
     else:
       h_pooled = h.mean(dim=1)
 
     value = self.value_head(h_pooled)
     return value.squeeze(-1)
-
 
 class TransformerActorCritic(nn.Module):
   """Unified container housing both TransformerActor and TransformerCritic."""

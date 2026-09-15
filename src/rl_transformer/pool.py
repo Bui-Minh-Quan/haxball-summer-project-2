@@ -2,6 +2,7 @@ import glob
 import math
 import os
 import random
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,7 +19,10 @@ from src.rl_transformer.transformer_model import TransformerActorCritic
 
 
 class PoolOpponentController(Controller):
-  """Samples opponents across Random, Heuristic, and Historical Transformer models."""
+  """Optimized opponent controller with in-memory checkpoint caching and fast inference."""
+
+  # Process-level cache to prevent repeated disk I/O across resets
+  _WEIGHTS_CACHE: dict[str, dict] = {}
 
   def __init__(
       self,
@@ -26,7 +30,8 @@ class PoolOpponentController(Controller):
       team: str = "blue",
       device: str = "cpu",
       p_random: float = 0.05,
-      p_heuristic: float = 0.40,
+      p_heuristic: float = 0.50,
+      frame_stack: int = 3,
   ):
     torch.set_num_threads(1)
     self.pool_dir = pool_dir
@@ -36,6 +41,8 @@ class PoolOpponentController(Controller):
 
     self.p_random = p_random
     self.p_heuristic = p_heuristic
+    self.frame_stack = frame_stack
+    self.history: dict[int, deque] = {}
 
     self.random_ctrl = RandomOpponentController()
     self.heuristic_ctrl = HeuristicBotController(
@@ -52,6 +59,7 @@ class PoolOpponentController(Controller):
     ]
 
   def reset_opponent(self):
+    self.history.clear()
     roll = random.random()
 
     if roll < self.p_random or not self.pool_dir or not os.path.exists(self.pool_dir):
@@ -62,6 +70,7 @@ class PoolOpponentController(Controller):
       self.current_mode = "heuristic"
       return
 
+    # In-memory cached model loading (zero disk hits after first load)
     history_files = glob.glob(os.path.join(self.pool_dir, "history_*.pt"))
     latest_file = os.path.join(self.pool_dir, "latest.pt")
     target_file = None
@@ -73,13 +82,20 @@ class PoolOpponentController(Controller):
 
     if target_file:
       try:
-        ckpt = torch.load(target_file, map_location=self.device, weights_only=False)
-        state_dict = (
-            ckpt["model_state_dict"]
-            if isinstance(ckpt, dict) and "model_state_dict" in ckpt
-            else ckpt
-        )
-        self.model.load_state_dict(state_dict, strict=False)
+        if target_file not in self._WEIGHTS_CACHE:
+          ckpt = torch.load(target_file, map_location=self.device, weights_only=False)
+          state_dict = (
+              ckpt["model_state_dict"]
+              if isinstance(ckpt, dict) and "model_state_dict" in ckpt
+              else ckpt
+          )
+          self._WEIGHTS_CACHE[target_file] = state_dict
+          # Keep cache bounded to 10 historical models
+          if len(self._WEIGHTS_CACHE) > 10:
+            oldest = next(iter(self._WEIGHTS_CACHE))
+            del self._WEIGHTS_CACHE[oldest]
+
+        self.model.load_state_dict(self._WEIGHTS_CACHE[target_file], strict=False)
         self.current_mode = "model"
         return
       except Exception:
@@ -96,22 +112,29 @@ class PoolOpponentController(Controller):
     player = sim.all_players[player_idx]
     obs = extract_entity_obs(sim, player, self.team)
 
-    actor_obs = {
-        "ego": torch.as_tensor(obs["ego"], dtype=torch.float32, device=self.device).unsqueeze(0),
-        "ball": torch.as_tensor(obs["ball"], dtype=torch.float32, device=self.device).unsqueeze(0),
-        "teammates": torch.as_tensor(obs["teammates"], dtype=torch.float32, device=self.device).unsqueeze(0),
-        "opponents": torch.as_tensor(obs["opponents"], dtype=torch.float32, device=self.device).unsqueeze(0),
-        "key_padding_mask": torch.as_tensor(obs["key_padding_mask"], dtype=torch.bool, device=self.device).unsqueeze(0),
-    }
+    if player_idx not in self.history or len(self.history[player_idx]) == 0:
+      self.history[player_idx] = deque(maxlen=self.frame_stack)
+      for _ in range(self.frame_stack):
+        self.history[player_idx].append(obs)
+    else:
+      self.history[player_idx].append(obs)
 
-    with torch.inference_mode():
-      action, _, _, _ = self.model.get_action_and_value(actor_obs, deterministic=True)
+    h_dq = self.history[player_idx]
+    stacked_ego = np.concatenate([f["ego"] for f in h_dq], axis=-1)
+    stacked_ball = np.concatenate([f["ball"] for f in h_dq], axis=-1)
+    stacked_mates = np.concatenate([f["teammates"] for f in h_dq], axis=-1)
+    stacked_opps = np.concatenate([f["opponents"] for f in h_dq], axis=-1)
 
-    m_idx = int(action[0, 0].item())
-    kick = bool(action[0, 1].item())
+    t_ego = torch.as_tensor(stacked_ego, dtype=torch.float32, device=self.device).unsqueeze(0)
+    t_ball = torch.as_tensor(stacked_ball, dtype=torch.float32, device=self.device).unsqueeze(0)
+    t_mates = torch.as_tensor(stacked_mates, dtype=torch.float32, device=self.device).unsqueeze(0)
+    t_opps = torch.as_tensor(stacked_opps, dtype=torch.float32, device=self.device).unsqueeze(0)
+    t_mask = torch.as_tensor(obs["key_padding_mask"], dtype=torch.bool, device=self.device).unsqueeze(0)
+
+    # Fast Actor-only inference (bypasses Categorical distributions and Critic)
+    m_idx, kick = self.model.actor.predict_action(t_ego, t_ball, t_mates, t_opps, t_mask)
     ego_x, ego_y = self._ego_dirs[m_idx]
     return Vec2(ego_x * self.sign, ego_y), kick
-
 
 class SelfPlayPool:
   """Manages model checkpoints and high-throughput batched evaluations for Entity Transformers."""
@@ -232,7 +255,7 @@ class SelfPlayPool:
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
 
-    # 1. Instantiate all matches concurrently
+    # 1. Instantiate all matches
     sims = []
     learner_phs = []
     opp_phs = []
@@ -269,6 +292,8 @@ class SelfPlayPool:
       sim = Simulation(match_config=cfg, goal_height=goal_height)
       if hasattr(sim, "mode"):
         sim.mode.state = "PLAYING"
+        if hasattr(sim.mode, "score_limit"):
+          sim.mode.score_limit = 999
         if hasattr(sim.mode, "reset_positions"):
           sim.mode.reset_positions = lambda *args, **kwargs: None
 
@@ -277,19 +302,30 @@ class SelfPlayPool:
 
     total_decisions = max_steps // action_repeat
 
-    # 2. Batched Lockstep Loop
+    # History deques for temporal frame stacking (K=3)
+    l_histories = [[deque(maxlen=3) for _ in range(l_size)] for _ in range(num_episodes)]
+    o_histories = [[deque(maxlen=3) for _ in range(o_size)] for _ in range(num_episodes)]
+
+    # 2. Batched Lockstep Decision Loop
     for dec in range(total_decisions):
-      # Extract entity tokens for all learner agents across all active matches
       l_egos, l_balls, l_mates, l_opps, l_masks = [], [], [], [], []
       for ep in range(num_episodes):
         sim = sims[ep]
         squad = sim.red_team if learner_teams[ep] == "red" else sim.blue_team
-        for pl in squad:
+        for pl_idx, pl in enumerate(squad):
           tokens = extract_entity_obs(sim, pl, learner_teams[ep])
-          l_egos.append(tokens["ego"])
-          l_balls.append(tokens["ball"])
-          l_mates.append(tokens["teammates"])
-          l_opps.append(tokens["opponents"])
+          h_dq = l_histories[ep][pl_idx]
+
+          if len(h_dq) == 0:
+            for _ in range(3):
+              h_dq.append(tokens)
+          else:
+            h_dq.append(tokens)
+
+          l_egos.append(np.concatenate([f["ego"] for f in h_dq], axis=-1))
+          l_balls.append(np.concatenate([f["ball"] for f in h_dq], axis=-1))
+          l_mates.append(np.concatenate([f["teammates"] for f in h_dq], axis=-1))
+          l_opps.append(np.concatenate([f["opponents"] for f in h_dq], axis=-1))
           l_masks.append(tokens["key_padding_mask"])
 
       learner_batch = {
@@ -314,18 +350,26 @@ class SelfPlayPool:
           learner_phs[ep][pl_idx].action = (Vec2(ex * sign, ey), k_val)
           cursor_l += 1
 
-      # Opponents action evaluation
+      # Opponent Action Handling
       if opponent_type == "model" and opponent_model is not None:
         o_egos, o_balls, o_mates, o_opps, o_masks = [], [], [], [], []
         for ep in range(num_episodes):
           sim = sims[ep]
           squad = sim.blue_team if learner_teams[ep] == "red" else sim.red_team
-          for pl in squad:
+          for pl_idx, pl in enumerate(squad):
             tokens = extract_entity_obs(sim, pl, opp_teams[ep])
-            o_egos.append(tokens["ego"])
-            o_balls.append(tokens["ball"])
-            o_mates.append(tokens["teammates"])
-            o_opps.append(tokens["opponents"])
+            h_dq = o_histories[ep][pl_idx]
+
+            if len(h_dq) == 0:
+              for _ in range(3):
+                h_dq.append(tokens)
+            else:
+              h_dq.append(tokens)
+
+            o_egos.append(np.concatenate([f["ego"] for f in h_dq], axis=-1))
+            o_balls.append(np.concatenate([f["ball"] for f in h_dq], axis=-1))
+            o_mates.append(np.concatenate([f["teammates"] for f in h_dq], axis=-1))
+            o_opps.append(np.concatenate([f["opponents"] for f in h_dq], axis=-1))
             o_masks.append(tokens["key_padding_mask"])
 
         opp_batch = {
@@ -364,19 +408,27 @@ class SelfPlayPool:
             dx, dy = random.choice(_ego_dirs)
             opp_phs[ep][pl_idx].action = (Vec2(dx, dy), random.random() < 0.20)
 
-      # Step simulations
+      # 3. Step Physics
       for _ in range(action_repeat):
         for ep in range(num_episodes):
           sim = sims[ep]
           goal = sim.step(1.0 / 60.0)
           if hasattr(sim, "mode"):
             sim.mode.state = "PLAYING"
+            if hasattr(sim.mode, "score_limit"):
+              sim.mode.score_limit = 999
           if goal is not None:
             scored = goal == f"{learner_teams[ep]}_goal"
             ep_rewards[ep] += 1.0 if scored else -1.0
             apply_eval_restart(sim, ep_idx=ep, is_initial=False)
 
-    # 3. Aggregate metrics
+            # Flush history on goal reset
+            for dq in l_histories[ep]:
+              dq.clear()
+            for dq in o_histories[ep]:
+              dq.clear()
+
+    # 4. Metrics Aggregation
     wins, losses, draws = 0, 0, 0
     total_scored, total_conceded = 0, 0
 
@@ -422,7 +474,7 @@ class SelfPlayPool:
         "net": net_goals,
         "score_tuple": (win_rate, round(mean_reward, 3), net_goals),
     }
-
+  
   def run_gatekeeper_gauntlet(
       self,
       learner_model: nn.Module,
@@ -536,7 +588,7 @@ class SelfPlayPool:
     cand_score = cand["score_tuple"]
 
     if target_tier == "champion":
-      is_promoted = cand["win_rate"] >= 0.25 and cand["net"] >= 5
+      is_promoted = cand["win_rate"] >= 0.40 and cand["net"] >= 8
       return is_promoted, results, cand_score
 
     if cand_score > self.best_score:
