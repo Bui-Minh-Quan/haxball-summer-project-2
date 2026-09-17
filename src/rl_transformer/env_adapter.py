@@ -429,7 +429,7 @@ class MatchEnv(gym.Env):
 
       if goal_event is not None:
         scored = goal_event == f"{self.learner_team}_goal"
-        total_reward += 1.0 if scored else -1.0
+        total_reward += 1.0 if scored else -2.0
         self._reset_kickoff()
         self.obs_history.clear()
         if hasattr(self.opponent_controller, "history"):
