@@ -7,8 +7,9 @@ import torch.optim as optim
 
 from src.rl_transformer.entity_obs import (
     BALL_DIM,
+    CRITIC_TOKENS,     
     EGO_DIM,
-    MAX_OPPONENTS,
+    MAX_OPPONENTS,   
     MAX_TEAMMATES,
     PLAYER_DIM,
     TOTAL_TOKENS,
@@ -135,8 +136,8 @@ def train_mappo(
 
   buf_critic_ball = torch.zeros((num_steps, n_agents_step, BALL_DIM), device=device)
   buf_critic_learners = torch.zeros((num_steps, n_agents_step, 3, PLAYER_DIM), device=device)
-  buf_critic_opps = torch.zeros((num_steps, n_agents_step, 3, PLAYER_DIM), device=device)
-  buf_critic_mask = torch.zeros((num_steps, n_agents_step, 7), dtype=torch.bool, device=device)
+  buf_critic_opps = torch.zeros((num_steps, n_agents_step, MAX_OPPONENTS, PLAYER_DIM), device=device)
+  buf_critic_mask = torch.zeros((num_steps, n_agents_step, CRITIC_TOKENS), dtype=torch.bool, device=device)
 
   actions_buf = torch.zeros((num_steps, n_agents_step, 2), device=device)
   logprobs_buf = torch.zeros((num_steps, n_agents_step), device=device)
@@ -234,8 +235,8 @@ def train_mappo(
 
     b_critic_ball = buf_critic_ball.reshape(-1, BALL_DIM)
     b_critic_learners = buf_critic_learners.reshape(-1, 3, PLAYER_DIM)
-    b_critic_opps = buf_critic_opps.reshape(-1, 3, PLAYER_DIM)
-    b_critic_mask = buf_critic_mask.reshape(-1, 7)
+    b_critic_opps = buf_critic_opps.reshape(-1, MAX_OPPONENTS, PLAYER_DIM)
+    b_critic_mask = buf_critic_mask.reshape(-1, CRITIC_TOKENS)
 
     b_actions = actions_buf.reshape(-1, 2)
     b_logprobs = logprobs_buf.reshape(-1)
@@ -340,18 +341,19 @@ def train_mappo(
         pool.register_champion(model, global_step)
 
         prev_wr = f"{recorded_score[0]*100:.1f}%" if recorded_score[0] >= 0 else "None"
-        prev_rew = f"{recorded_score[1]:+.3f}" if recorded_score[0] >= 0 else "None"
+        prev_net = f"{int(recorded_score[1]):+d}" if recorded_score[0] >= 0 else "None"
+        prev_rew = f"{recorded_score[2]:+.3f}" if recorded_score[0] >= 0 else "None"
         print(
-            f"   ⭐⭐ PROMOTED! New Best Score ({target_tier}) -> [WR: {cand['win_rate']*100:.1f}%, Reward: {cand['mean_reward']:+.3f}, Net: {cand['net']:+d}]\n"
-            f"      (Defeated previous record: [WR: {prev_wr}, Reward: {prev_rew}]) -> Saved: {save_path} (Eval took {eval_duration:.1f}s)"
+            f"   ⭐⭐ PROMOTED! New Best Score ({target_tier}) -> [WR: {cand['win_rate']*100:.1f}%, Net: {cand['net']:+d}, Reward: {cand['mean_reward']:+.3f}]\n"
+            f"      (Defeated previous record: [WR: {prev_wr}, Net: {prev_net}, Reward: {prev_rew}]) -> Saved: {save_path} (Eval took {eval_duration:.1f}s)"
         )
       else:
         best_wr = f"{recorded_score[0]*100:.1f}%" if recorded_score[0] >= 0 else "None"
-        best_rew = f"{recorded_score[1]:+.3f}" if recorded_score[0] >= 0 else "None"
-        best_net = f"{recorded_score[2]:+d}" if recorded_score[0] >= 0 else "None"
+        best_net = f"{int(recorded_score[1]):+d}" if recorded_score[0] >= 0 else "None"
+        best_rew = f"{recorded_score[2]:+.3f}" if recorded_score[0] >= 0 else "None"
         print(
             f"   ❌ Retaining current baseline. Did not pass criteria for {target_tier}: "
-            f"[WR: {best_wr}, Reward: {best_rew}, Net: {best_net}] (Eval took {eval_duration:.1f}s)"
+            f"[WR: {best_wr}, Net: {best_net}, Reward: {best_rew}] (Eval took {eval_duration:.1f}s)"
         )
 
       interval_start_time = time.time()

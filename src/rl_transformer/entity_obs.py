@@ -12,14 +12,14 @@ SINGLE_EGO_DIM = 9
 SINGLE_BALL_DIM = 14
 SINGLE_PLAYER_DIM = 9
 
-# Exported stacked dimensions for PPO buffers & Model heads
 EGO_DIM = SINGLE_EGO_DIM * FRAME_STACK        # 27
 BALL_DIM = SINGLE_BALL_DIM * FRAME_STACK      # 42
 PLAYER_DIM = SINGLE_PLAYER_DIM * FRAME_STACK  # 27
 
 MAX_TEAMMATES = 2
-MAX_OPPONENTS = 3
-TOTAL_TOKENS = 1 + 1 + MAX_TEAMMATES + MAX_OPPONENTS  # 7 Tokens
+MAX_OPPONENTS = 5                             # Expanded from 3 to 5
+TOTAL_TOKENS = 1 + 1 + MAX_TEAMMATES + MAX_OPPONENTS  # 1 Ego + 1 Ball + 2 Mates + 5 Opps = 9 Tokens
+CRITIC_TOKENS = 1 + 3 + MAX_OPPONENTS                 # 1 Ball + 3 Learners + 5 Opps = 9 Tokens
 
 def extract_entity_obs(
     sim: Simulation, ego_player: Player, team: str
@@ -221,9 +221,9 @@ def extract_global_critic_entities(
     learners_tokens[idx] = _encode_player(pl)
     learners_mask[idx] = False
 
-  opponents_tokens = np.zeros((3, SINGLE_PLAYER_DIM), dtype=np.float32)
-  opponents_mask = [True] * 3
-  for idx, opp in enumerate(opp_team[:3]):
+  opponents_tokens = np.zeros((MAX_OPPONENTS, SINGLE_PLAYER_DIM), dtype=np.float32)
+  opponents_mask = [True] * MAX_OPPONENTS
+  for idx, opp in enumerate(opp_team[:MAX_OPPONENTS]):
     opponents_tokens[idx] = _encode_player(opp)
     opponents_mask[idx] = False
 

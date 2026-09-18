@@ -16,6 +16,7 @@ from src.rl_transformer.entity_obs import (
     MAX_OPPONENTS,
     MAX_TEAMMATES,
     PLAYER_DIM,
+    CRITIC_TOKENS,
     TOTAL_TOKENS,
     extract_entity_obs,
     extract_global_critic_entities,
@@ -132,9 +133,9 @@ class MatchEnv(gym.Env):
             0, 1, shape=actor_shape_prefix + (TOTAL_TOKENS,), dtype=bool
         ),
         "critic_ball": spaces.Box(-np.inf, np.inf, shape=(BALL_DIM,), dtype=np.float32),
-        "critic_learners": spaces.Box(-np.inf, np.inf, shape=(3, PLAYER_DIM), dtype=np.float32),
-        "critic_opponents": spaces.Box(-np.inf, np.inf, shape=(3, PLAYER_DIM), dtype=np.float32),
-        "critic_mask": spaces.Box(0, 1, shape=(7,), dtype=bool),
+        "critic_learners": spaces.Box(-np.inf, np.inf, shape=(MAX_TEAMMATES + 1, PLAYER_DIM), dtype=np.float32),
+        "critic_opponents": spaces.Box(-np.inf, np.inf, shape=(MAX_OPPONENTS, PLAYER_DIM), dtype=np.float32),
+        "critic_mask": spaces.Box(0, 1, shape=(CRITIC_TOKENS,), dtype=bool),
     })
 
     if self.learner_team_size == 1:
@@ -429,7 +430,7 @@ class MatchEnv(gym.Env):
 
       if goal_event is not None:
         scored = goal_event == f"{self.learner_team}_goal"
-        total_reward += 1.0 if scored else -2.0
+        total_reward += 1.5 if scored else -1.0
         self._reset_kickoff()
         self.obs_history.clear()
         if hasattr(self.opponent_controller, "history"):
