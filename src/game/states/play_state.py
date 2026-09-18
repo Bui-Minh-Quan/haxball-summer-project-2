@@ -96,6 +96,9 @@ class PlayState(GameState):
     self._sprite_cache = {}
     self._load_ball_sprite()
 
+    self._prev_mode_state = getattr(self.match_config.mode, "state", None)
+    self._reset_ai_controllers()
+
   def exit(self):
     """Stops all match audio when popping or transitioning out of PlayState."""
     if pygame.mixer.get_init():
@@ -160,6 +163,12 @@ class PlayState(GameState):
     self._sprite_cache[key] = aa_surf
     return aa_surf
 
+  def _reset_ai_controllers(self):
+    """Flushes temporal frame buffers on kickoffs and goal resets."""
+    for slot in self.match_config.roster:
+      if hasattr(slot.controller, "reset"):
+        slot.controller.reset()
+
   def _pause_game(self):
     if not self.is_match_finished:
       if pygame.mixer.get_init():
@@ -182,6 +191,12 @@ class PlayState(GameState):
 
   def update(self, dt: float):
     mode = self.match_config.mode
+
+    # Reset controller temporal frames when match transitions from kickoff to active play
+    cur_state = getattr(mode, "state", None)
+    if self._prev_mode_state == "GOAL_SCORED" and cur_state == "PLAYING":
+      self._reset_ai_controllers()
+    self._prev_mode_state = cur_state
 
     if not self.is_match_finished:
       goal_event = self.sim.step(dt=dt)

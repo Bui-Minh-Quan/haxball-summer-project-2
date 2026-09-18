@@ -6,7 +6,7 @@ from config.match_config import MatchConfig, PlayerSlot, PlayerStats
 from src.bots.heuristic_bot import TeamHeuristicCoordinator
 from src.engine.controllers import HeuristicBotController
 from src.engine.modes.classic_mode import ClassicMatchMode
-from src.game.controllers import KeyboardController, ONNXBotController
+from src.game.controllers import KeyboardController, ONNXBotController, ONNXTransformerController
 from src.game.state_manager import GameState
 from src.game.states.play_state import PlayState
 from src.game.ui.button import Button
@@ -227,8 +227,8 @@ class MatchSetupState(GameState):
     self.drop_opponent = Dropup(
         rect=pygame.Rect(left_x, 395, col_w, 42),
         label="OPPONENT TYPE",
-        options=["MLP Agent", "Heuristic Bot"],
-        values=["rl", "heuristic"],
+        options=["Transformer Agent", "MLP Agent", "Heuristic Bot"],
+        values=["transformer", "rl", "heuristic"],
         default_idx=s.get("opp_idx", 0),
     )
 
@@ -302,13 +302,23 @@ class MatchSetupState(GameState):
   def _create_bot_controller(
       self, bot_type: str, team: str, format_size: int
   ) -> tuple[object, str]:
-    """Instantiates ONNXBotController or HeuristicBotController based on team format."""
-    if bot_type == "rl":
+    """Instantiates ONNXTransformerController, ONNXBotController, or HeuristicBotController."""
+    if bot_type == "transformer":
+      model_path = os.path.join(
+          "assets", "models", f"transformer_{format_size}v{format_size}.onnx"
+      )
+      if os.path.exists(model_path):
+        return ONNXTransformerController(model_path, team=team), "Transformer Bot"
+      print(
+          f"[Warning] ONNX model {model_path} not found. Falling back to Heuristic Bot."
+      )
+
+    elif bot_type == "rl":
       model_path = os.path.join(
           "assets", "models", f"stage{format_size}.onnx"
       )
       if os.path.exists(model_path):
-        return ONNXBotController(model_path, team=team), f"RL Bot"
+        return ONNXBotController(model_path, team=team), "MLP Bot"
       print(
           f"[Warning] ONNX model {model_path} not found. Falling back to Heuristic Bot."
       )

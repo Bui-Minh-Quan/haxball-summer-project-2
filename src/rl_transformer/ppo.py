@@ -1,5 +1,6 @@
 import os
 import time
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,9 +8,9 @@ import torch.optim as optim
 
 from src.rl_transformer.entity_obs import (
     BALL_DIM,
-    CRITIC_TOKENS,     
+    CRITIC_TOKENS,
     EGO_DIM,
-    MAX_OPPONENTS,   
+    MAX_OPPONENTS,
     MAX_TEAMMATES,
     PLAYER_DIM,
     TOTAL_TOKENS,
@@ -115,7 +116,7 @@ def train_mappo(
     max_steps: int = 3600,
     action_repeat: int = 10,
 ):
-  """Accelerated Multi-Agent PPO optimized for Entity-Transformer Architectures."""
+  """Accelerated Multi-Agent PPO with Live Training Telemetry."""
   os.makedirs(save_dir, exist_ok=True)
   effective_pool_dir = pool_dir or os.path.join(save_dir, "pool")
   pool = SelfPlayPool(effective_pool_dir)
@@ -149,7 +150,16 @@ def train_mappo(
   next_actor_obs, next_critic_obs = _unpack_and_tensorize_obs(next_payload, team_size, device)
   next_done = torch.zeros(n_agents_step, device=device)
 
+  # ── Telemetry & Rolling Statistics ──
+  track_window = 60
+  recent_returns = deque(maxlen=track_window)
+  recent_outcomes = deque(maxlen=track_window)  # "win", "draw", "loss"
+  recent_scored = deque(maxlen=track_window)
+  recent_conceded = deque(maxlen=track_window)
+  running_env_rewards = np.zeros(num_envs, dtype=np.float32)
+
   global_step = 0
+  iteration = 0
   next_eval_step = eval_freq
   interval_start_time = time.time()
   interval_steps = 0
@@ -160,6 +170,7 @@ def train_mappo(
   )
 
   while global_step < total_timesteps:
+    iteration += 1
     progress = global_step / float(total_timesteps)
     curr_lr = lr_init + progress * (lr_final - lr_init)
     curr_ent = ent_coef_init + progress * (ent_coef_final - ent_coef_init)
@@ -195,8 +206,41 @@ def train_mappo(
       action_np = action.cpu().numpy()
       env_action = action_np if team_size == 1 else action_np.reshape(num_envs, team_size, 2)
 
-      next_payload, reward_np, terms, truncs, _ = envs.step(env_action)
+      next_payload, reward_np, terms, truncs, next_infos = envs.step(env_action)
       next_dones_np = np.logical_or(terms, truncs)
+
+      # Accumulate match returns per environment before agent tiling
+      running_env_rewards += reward_np.flatten()
+
+      # Record completed match telemetry
+      for env_i in range(num_envs):
+        if next_dones_np[env_i]:
+          recent_returns.append(float(running_env_rewards[env_i]))
+          running_env_rewards[env_i] = 0.0
+
+          s_red, s_blue = None, None
+          if isinstance(next_infos, dict):
+            if "final_info" in next_infos and next_infos["final_info"][env_i] is not None:
+              fin = next_infos["final_info"][env_i]
+              s_red = fin.get("score_red", None)
+              s_blue = fin.get("score_blue", None)
+            elif "score_red" in next_infos and "score_blue" in next_infos:
+              try:
+                s_red = next_infos["score_red"][env_i]
+                s_blue = next_infos["score_blue"][env_i]
+              except (IndexError, TypeError):
+                pass
+
+          if s_red is not None and s_blue is not None:
+            diff = int(s_red) - int(s_blue)
+            if diff > 0:
+              recent_outcomes.append("win")
+            elif diff < 0:
+              recent_outcomes.append("loss")
+            else:
+              recent_outcomes.append("draw")
+            recent_scored.append(int(s_red))
+            recent_conceded.append(int(s_blue))
 
       if team_size > 1 and reward_np.size == num_envs:
         reward_np = np.repeat(reward_np, team_size)
@@ -250,6 +294,8 @@ def train_mappo(
         else torch.zeros_like(b_advantages)
     )
 
+    pg_losses, v_losses, entropies, kl_divs, clip_fracs = [], [], [], [], []
+
     b_indices = np.arange(batch_size)
     for _ in range(update_epochs):
       np.random.shuffle(b_indices)
@@ -278,7 +324,8 @@ def train_mappo(
               action=b_actions[mb_idx],
           )
 
-          ratio = (newlogprob - b_logprobs[mb_idx]).exp()
+          logratio = newlogprob - b_logprobs[mb_idx]
+          ratio = logratio.exp()
           mb_adv = b_advantages[mb_idx]
 
           pg_loss1 = -mb_adv * ratio
@@ -288,6 +335,10 @@ def train_mappo(
           v_loss = 0.5 * ((newvalue.flatten() - b_returns[mb_idx]) ** 2).mean()
           loss = pg_loss - curr_ent * entropy.mean() + vf_coef * v_loss
 
+          with torch.no_grad():
+            approx_kl = ((ratio - 1.0) - logratio).mean()
+            clip_frac = ((ratio - 1.0).abs() > clip_range).float().mean()
+
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -295,14 +346,42 @@ def train_mappo(
         scaler.step(optimizer)
         scaler.update()
 
+        pg_losses.append(pg_loss.item())
+        v_losses.append(v_loss.item())
+        entropies.append(entropy.mean().item())
+        kl_divs.append(approx_kl.item())
+        clip_fracs.append(clip_frac.item())
+
     if pool:
       pool.save_latest(model)
+
+    # ── Live Rollout Telemetry Summary ──
+    interval_sps = int(interval_steps / max(1e-3, (time.time() - interval_start_time)))
+    n_recent = len(recent_outcomes)
+
+    if n_recent > 0:
+      wr = (recent_outcomes.count("win") / n_recent) * 100.0
+      dr = (recent_outcomes.count("draw") / n_recent) * 100.0
+      lr_rate = (recent_outcomes.count("loss") / n_recent) * 100.0
+      avg_sc = np.mean(recent_scored)
+      avg_conc = np.mean(recent_conceded)
+      net_sc = avg_sc - avg_conc
+      avg_ret = np.mean(recent_returns)
+    else:
+      wr, dr, lr_rate = 0.0, 0.0, 0.0
+      avg_sc, avg_conc, net_sc, avg_ret = 0.0, 0.0, 0.0, 0.0
+
+    print(
+        f"⚡ [TRAIN @ Step {global_step:,} | Iter {iteration} | SPS: {interval_sps} | LR: {curr_lr:.2e} | Ent: {curr_ent:.4f}]\n"
+        f"   🎮 Match History (Last {n_recent}): WR: {wr:5.1f}% | DR: {dr:4.1f}% | LR: {lr_rate:4.1f}% | "
+        f"Rew: {avg_ret:+.3f} | Goals: {avg_sc:.1f} - {avg_conc:.1f} ({net_sc:+.1f} Net)\n"
+        f"   📉 PPO Losses: Policy: {np.mean(pg_losses):+.4f} | Value: {np.mean(v_losses):.4f} | "
+        f"Entropy: {np.mean(entropies):.3f} | KL: {np.mean(kl_divs):.5f} | Clip: {np.mean(clip_fracs)*100:4.1f}%"
+    )
 
     # ── 4. Fast Lockstep Evaluation ──
     if global_step >= next_eval_step:
       next_eval_step += eval_freq
-      interval_sps = int(interval_steps / max(1e-3, (time.time() - interval_start_time)))
-
       print(f"\n📊 [EVALUATION @ Step {global_step:,} | Rollout SPS: {interval_sps} | Tiers: {eval_tiers}]")
 
       eval_t0 = time.time()
@@ -342,7 +421,7 @@ def train_mappo(
 
         prev_wr = f"{recorded_score[0]*100:.1f}%" if recorded_score[0] >= 0 else "None"
         prev_net = f"{int(recorded_score[1]):+d}" if recorded_score[0] >= 0 else "None"
-        prev_rew = f"{recorded_score[2]:+.3f}" if recorded_score[0] >= 0 else "None"
+        prev_rew = f"{float(recorded_score[2]):+.3f}" if recorded_score[0] >= 0 else "None"
         print(
             f"   ⭐⭐ PROMOTED! New Best Score ({target_tier}) -> [WR: {cand['win_rate']*100:.1f}%, Net: {cand['net']:+d}, Reward: {cand['mean_reward']:+.3f}]\n"
             f"      (Defeated previous record: [WR: {prev_wr}, Net: {prev_net}, Reward: {prev_rew}]) -> Saved: {save_path} (Eval took {eval_duration:.1f}s)"
@@ -350,7 +429,7 @@ def train_mappo(
       else:
         best_wr = f"{recorded_score[0]*100:.1f}%" if recorded_score[0] >= 0 else "None"
         best_net = f"{int(recorded_score[1]):+d}" if recorded_score[0] >= 0 else "None"
-        best_rew = f"{recorded_score[2]:+.3f}" if recorded_score[0] >= 0 else "None"
+        best_rew = f"{float(recorded_score[2]):+.3f}" if recorded_score[0] >= 0 else "None"
         print(
             f"   ❌ Retaining current baseline. Did not pass criteria for {target_tier}: "
             f"[WR: {best_wr}, Net: {best_net}, Reward: {best_rew}] (Eval took {eval_duration:.1f}s)"

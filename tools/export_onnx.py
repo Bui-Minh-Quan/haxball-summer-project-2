@@ -241,9 +241,9 @@ def main():
   parser.add_argument("--output", type=str, help="Destination .onnx file path")
   parser.add_argument(
       "--arch",
-      choices=["mlp", "transformer"],
-      default="mlp",
-      help="Model architecture",
+      choices=["mlp", "transformer", "all"],
+      default="transformer",
+      help="Architecture to export (default: transformer)",
   )
   args = parser.parse_args()
 
@@ -254,36 +254,64 @@ def main():
       export_gen3_transformer(args.checkpoint, args.output)
     return
 
-  # Default batch export for tonight's game deployment
-  default_deployments = [
-      (
-          "Notebooks/training_2/models/stage1/phase4/best_model.pt",
-          "assets/models/stage1.onnx",
-          "mlp",
-      ),
-      (
-          "Notebooks/training_2/models/stage2/phase3/best_model.pt",
-          "assets/models/stage2.onnx",
-          "mlp",
-      ),
-      (
-          "Notebooks/training_2/models/stage3/phase2/best_model.pt",
-          "assets/models/stage3.onnx",
-          "mlp",
-      ),
-  ]
+  deployments = []
 
-  print("🚀 Exporting active deployment models to assets/models/...")
-  for pt_path, onnx_path, arch in default_deployments:
-    full_pt = os.path.join(ROOT_DIR, pt_path)
-    full_onnx = os.path.join(ROOT_DIR, onnx_path)
+  if args.arch in ("mlp", "all"):
+    deployments.extend([
+        (
+            "Notebooks/training_2/models/stage1/phase4/best_model.pt",
+            "assets/models/stage1.onnx",
+            "mlp",
+        ),
+        (
+            "Notebooks/training_2/models/stage2/phase3/best_model.pt",
+            "assets/models/stage2.onnx",
+            "mlp",
+        ),
+        (
+            "Notebooks/training_2/models/stage3/phase2/best_model.pt",
+            "assets/models/stage3.onnx",
+            "mlp",
+        ),
+    ])
+
+  if args.arch in ("transformer", "all"):
+    deployments.extend([
+        (
+            "Notebooks/training_transformer/models/stage1/phase4/best_model.pt",
+            "assets/models/transformer_1v1.onnx",
+            "transformer",
+        ),
+        (
+            "Notebooks/training_transformer/models/stage2/phase3/best_model.pt",
+            "assets/models/transformer_2v2.onnx",
+            "transformer",
+        ),
+        (
+            "Notebooks/training_transformer/models/stage3/phase3/best_model.pt",
+            "assets/models/transformer_3v3.onnx",
+            "transformer",
+        ),
+    ])
+
+  print(f"🚀 Exporting deployment models (Target: {args.arch}) to assets/models/...")
+  for pt_rel, onnx_rel, arch in deployments:
+    full_pt = os.path.join(ROOT_DIR, pt_rel)
+    full_onnx = os.path.join(ROOT_DIR, onnx_rel)
+
+    # Fallback to final_model.pt if best_model.pt is absent
+    if not os.path.exists(full_pt):
+      alt_pt = full_pt.replace("best_model.pt", "final_model.pt")
+      if os.path.exists(alt_pt):
+        full_pt = alt_pt
+
     if os.path.exists(full_pt):
       if arch == "mlp":
         export_gen2_mlp(full_pt, full_onnx)
       else:
         export_gen3_transformer(full_pt, full_onnx)
     else:
-      print(f"⚠️ Skipping missing checkpoint: {full_pt}")
+      print(f"⚠️ Checkpoint not found, skipping: {full_pt}")
 
 
 if __name__ == "__main__":

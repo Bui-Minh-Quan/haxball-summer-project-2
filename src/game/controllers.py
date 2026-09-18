@@ -1,3 +1,4 @@
+from collections import deque
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -7,6 +8,7 @@ import pygame
 from src.engine.controllers import Controller
 from src.engine.vector import Vec2
 from src.rl.obs import extract_actor_obs
+from src.rl_transformer.entity_obs import extract_entity_obs
 
 # Global session cache to avoid duplicate model loads across player slots
 _ONNX_SESSIONS: dict[str, ort.InferenceSession] = {}
@@ -61,14 +63,13 @@ class KeyboardController(Controller):
 
 
 class ONNXBotController(Controller):
-  """Ultra-fast ONNX Runtime inference controller for 1v1, 2v2, and 3v3."""
+  """ONNX Runtime inference controller for Gen 2 MLP models."""
 
   def __init__(self, model_path: str | Path, team: str):
     self.session = get_or_create_onnx_session(model_path)
     self.team = team.lower()
     self.sign = 1.0 if self.team == "red" else -1.0
 
-    # Ego-centric discrete move mapping: index -> (dx, dy)
     self._ego_dirs = [
         (0.0, 0.0),   # 0: None
         (0.0, -1.0),  # 1: Up
@@ -83,20 +84,73 @@ class ONNXBotController(Controller):
 
   def get_action(self, player_idx: int, sim: Any) -> tuple[Vec2, bool]:
     player = sim.all_players[player_idx]
-    
-    # 1. Extract Gen 2 64-dim ego observation
     obs = extract_actor_obs(sim, player, self.team)
-
-    # 2. Batch dim injection: (64,) -> (1, 64)
     feed = {"obs": obs[np.newaxis, :]}
     logits_move, logits_kick = self.session.run(None, feed)
 
-    # 3. Deterministic Argmax
     m_idx = int(np.argmax(logits_move, axis=-1)[0])
     kick_val = bool(np.argmax(logits_kick, axis=-1)[0])
 
-    # 4. Map ego direction back to pitch world coordinates
     ego_x, ego_y = self._ego_dirs[m_idx]
-    world_move = Vec2(ego_x * self.sign, ego_y)
+    return Vec2(ego_x * self.sign, ego_y), kick_val
 
-    return world_move, kick_val
+
+class ONNXTransformerController(Controller):
+  """High-performance ONNX inference controller for Entity-Transformer agents (Gen 3)."""
+
+  def __init__(self, model_path: str | Path, team: str, frame_stack: int = 3):
+    self.session = get_or_create_onnx_session(model_path)
+    self.team = team.lower()
+    self.sign = 1.0 if self.team == "red" else -1.0
+    self.frame_stack = frame_stack
+    self.history: deque = deque(maxlen=frame_stack)
+
+    self._ego_dirs = [
+        (0.0, 0.0),   # 0: None
+        (0.0, -1.0),  # 1: Up
+        (0.0, 1.0),   # 2: Down
+        (-1.0, 0.0),  # 3: Backward
+        (1.0, 0.0),   # 4: Forward
+        (-1.0, -1.0), # 5: Backward-Up
+        (1.0, -1.0),  # 6: Forward-Up
+        (-1.0, 1.0),  # 7: Backward-Down
+        (1.0, 1.0),   # 8: Forward-Down
+    ]
+
+  def reset(self):
+    """Clears temporal frame memory on kickoffs, goals, or pitch resets."""
+    self.history.clear()
+
+  def get_action(self, player_idx: int, sim: Any) -> tuple[Vec2, bool]:
+    player = sim.all_players[player_idx]
+    raw_obs = extract_entity_obs(sim, player, self.team)
+
+    # Prime temporal history queue on the first step to prevent zero-padding drift
+    if len(self.history) == 0:
+      for _ in range(self.frame_stack):
+        self.history.append(raw_obs)
+    else:
+      self.history.append(raw_obs)
+
+    # Concatenate features across time for each entity token
+    ego_stacked = np.concatenate([f["ego"] for f in self.history], axis=-1)[np.newaxis, :]
+    ball_stacked = np.concatenate([f["ball"] for f in self.history], axis=-1)[np.newaxis, :]
+    mates_stacked = np.concatenate([f["teammates"] for f in self.history], axis=-1)[np.newaxis, :]
+    opps_stacked = np.concatenate([f["opponents"] for f in self.history], axis=-1)[np.newaxis, :]
+    mask = raw_obs["key_padding_mask"][np.newaxis, :]
+
+    feed = {
+        "ego": ego_stacked.astype(np.float32),
+        "ball": ball_stacked.astype(np.float32),
+        "teammates": mates_stacked.astype(np.float32),
+        "opponents": opps_stacked.astype(np.float32),
+        "key_padding_mask": mask.astype(bool),
+    }
+
+    logits_move, logits_kick = self.session.run(None, feed)
+
+    m_idx = int(np.argmax(logits_move, axis=-1)[0])
+    kick_val = bool(logits_kick[0, 1] > logits_kick[0, 0])
+
+    ego_x, ego_y = self._ego_dirs[m_idx]
+    return Vec2(ego_x * self.sign, ego_y), kick_val
